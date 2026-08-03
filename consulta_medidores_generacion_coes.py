@@ -1,20 +1,25 @@
-# -*- coding: utf-8 -*-
 """
-Descarga el reporte de Medidores de Generación del COES.
-Página: https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion
-Endpoint (visto en medidores.js, función exportarFormato):
-    POST https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/exportar
+Streamlit app: Descarga el reporte de Medidores de Generación del COES.
+
+Página:   https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion
+Endpoint: POST https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/exportar
+
+Ejecutar con:
+    streamlit run app_medidores_generacion.py
 """
+
+import io
+from datetime import date, timedelta
 
 import requests
+import streamlit as st
 
 # ---------------------------------------------------------------------------
-RUTA_ARCHIVO = r"C:\Users\GZ6710\OneDrive - ENGIE\Escritorio\ENGIE\2026\Plexos\SCRIPT\_tmp_medidores_generacion.xlsx"
-
+# Configuración fija
+# ---------------------------------------------------------------------------
 URL_EXPORTAR = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/exportar"
 REFERER = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion"
 
-# Lista de empresas vista en tu payload de ejemplo (ajusta según necesites)
 DEFAULT_EMPRESAS = (
     "14260,69,15214,11772,12439,11777,10481,12056,12362,13196,12896,10628,15707,"
     "10420,12708,13165,10901,15571,12584,11095,17,11153,58,19,10684,30,27,40,"
@@ -30,36 +35,43 @@ DEFAULT_EMPRESAS = (
 DEFAULT_TIPOS_GENERACION = "4,1,3,2"   # ver categorías reales en el <select> del formulario
 DEFAULT_PARAMETROS = "1,2,4,3"          # ver checkboxes de parámetros en el formulario
 
+FORMATOS = {"Excel (.xlsx)": "2", "CSV": "1"}  # ajustar según valores reales del <select>
 
-def _session():
+
+# ---------------------------------------------------------------------------
+# Lógica de descarga (adaptada del script original)
+# ---------------------------------------------------------------------------
+def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": REFERER,
-        "Origin": "https://www.coes.org.pe",
-    })
+    s.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": REFERER,
+            "Origin": "https://www.coes.org.pe",
+        }
+    )
     s.get(REFERER, timeout=30)
     return s
 
 
 def descargar_medidores_generacion(
-    fecha_inicial,
-    fecha_final,
-    empresas=DEFAULT_EMPRESAS,
-    tipos_generacion=DEFAULT_TIPOS_GENERACION,
-    central="1",
-    parametros=DEFAULT_PARAMETROS,
-    tipo="2",
-    formato="2",
-    ruta_salida=RUTA_ARCHIVO,
+    fecha_inicial: str,
+    fecha_final: str,
+    empresas: str = DEFAULT_EMPRESAS,
+    tipos_generacion: str = DEFAULT_TIPOS_GENERACION,
+    central: str = "1",
+    parametros: str = DEFAULT_PARAMETROS,
+    tipo: str = "2",
+    formato: str = "2",
 ):
     """
     fecha_inicial / fecha_final: strings en formato dd/mm/yyyy.
-    Devuelve la ruta del archivo descargado, o None si falló.
+
+    Devuelve (contenido_bytes, content_type, nombre_archivo_sugerido) si tuvo éxito,
+    o (None, mensaje_error, None) si falló.
     """
     s = _session()
-
     payload = {
         "fechaInicial": fecha_inicial,
         "fechaFinal": fecha_final,
@@ -71,30 +83,103 @@ def descargar_medidores_generacion(
         "formato": formato,
     }
 
-    print(f"Descargando medidores de generación {fecha_inicial} - {fecha_final} ...")
     resp = s.post(URL_EXPORTAR, data=payload, timeout=60)
     resp.raise_for_status()
 
     content_type = resp.headers.get("Content-Type", "")
-
     if "json" in content_type:
-        # El servidor devolvió JSON en vez del archivo -> probablemente
-        # es un flujo en 2 pasos (generar + descargar), como en mantenimientos.
-        print(f"Respuesta JSON inesperada (Content-Type: {content_type!r}):")
-        print(resp.text[:500])
-        print(
+        # El servidor devolvió JSON en vez del archivo -> probablemente es un
+        # flujo en 2 pasos (generar + descargar), como en mantenimientos.
+        mensaje = (
+            f"Respuesta JSON inesperada (Content-Type: {content_type!r}):\n\n"
+            f"{resp.text[:500]}\n\n"
             "Esto sugiere que 'exportar' solo genera el archivo y falta un "
             "segundo GET para descargarlo, como en el flujo de mantenimientos. "
-            "Revisa Network para encontrar esa segunda petición."
+            "Revisa la pestaña Network del navegador para encontrar esa segunda petición."
         )
-        return None
+        return None, mensaje, None
 
-    with open(ruta_salida, "wb") as f:
-        f.write(resp.content)
+    # Intentar extraer un nombre de archivo sugerido por el servidor
+    disposition = resp.headers.get("Content-Disposition", "")
+    nombre_archivo = "medidores_generacion.xlsx"
+    if "filename=" in disposition:
+        nombre_archivo = disposition.split("filename=")[-1].strip('"; ')
 
-    print(f"Archivo guardado en: {ruta_salida}")
-    return ruta_salida
+    return resp.content, content_type, nombre_archivo
 
 
-if __name__ == "__main__":
-    descargar_medidores_generacion("01/05/2026", "31/05/2026")
+# ---------------------------------------------------------------------------
+# UI de Streamlit
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="COES · Medidores de Generación", page_icon="⚡")
+
+st.title("⚡ Medidores de Generación — COES")
+st.caption(
+    "Descarga el reporte de Medidores de Generación desde el portal del COES "
+    "(www.coes.org.pe)."
+)
+
+with st.form("form_descarga"):
+    col1, col2 = st.columns(2)
+    hoy = date.today()
+    with col1:
+        fecha_inicial = st.date_input(
+            "Fecha inicial", value=hoy.replace(day=1) - timedelta(days=1)
+        )
+    with col2:
+        fecha_final = st.date_input("Fecha final", value=hoy)
+
+    with st.expander("Parámetros avanzados"):
+        empresas = st.text_area(
+            "Empresas (IDs separados por coma)",
+            value=DEFAULT_EMPRESAS,
+            height=100,
+        )
+        tipos_generacion = st.text_input(
+            "Tipos de generación (IDs separados por coma)",
+            value=DEFAULT_TIPOS_GENERACION,
+        )
+        parametros = st.text_input(
+            "Parámetros (IDs separados por coma)",
+            value=DEFAULT_PARAMETROS,
+        )
+        central = st.text_input("Central", value="1")
+        tipo = st.text_input("Tipo", value="2")
+        formato_label = st.selectbox("Formato de salida", list(FORMATOS.keys()))
+
+    enviado = st.form_submit_button("Descargar reporte")
+
+if enviado:
+    if fecha_inicial > fecha_final:
+        st.error("La fecha inicial no puede ser posterior a la fecha final.")
+    else:
+        fi_str = fecha_inicial.strftime("%d/%m/%Y")
+        ff_str = fecha_final.strftime("%d/%m/%Y")
+
+        with st.spinner(f"Descargando medidores de generación {fi_str} – {ff_str} ..."):
+            try:
+                contenido, content_type_o_error, nombre_archivo = descargar_medidores_generacion(
+                    fecha_inicial=fi_str,
+                    fecha_final=ff_str,
+                    empresas=empresas,
+                    tipos_generacion=tipos_generacion,
+                    central=central,
+                    parametros=parametros,
+                    tipo=tipo,
+                    formato=FORMATOS[formato_label],
+                )
+            except requests.exceptions.RequestException as exc:
+                st.error(f"Error de conexión con el portal del COES: {exc}")
+                contenido = None
+
+        if contenido is None and content_type_o_error is not None:
+            # content_type_o_error contiene el mensaje de error (caso JSON inesperado)
+            st.warning(content_type_o_error)
+        elif contenido is not None:
+            st.success(f"Archivo listo: {nombre_archivo}")
+            st.download_button(
+                label="⬇️ Guardar archivo",
+                data=io.BytesIO(contenido),
+                file_name=nombre_archivo,
+                mime=content_type_o_error or "application/octet-stream",
+            )
