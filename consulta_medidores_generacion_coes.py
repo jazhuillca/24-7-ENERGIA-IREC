@@ -83,7 +83,7 @@ def descargar_medidores_generacion(
         "formato": formato,
     }
 
-    resp = s.post(URL_EXPORTAR, data=payload, timeout=60)
+    resp = s.post(URL_EXPORTAR, data=payload, timeout=180)
     resp.raise_for_status()
 
     content_type = resp.headers.get("Content-Type", "")
@@ -156,6 +156,13 @@ if enviado:
         fi_str = fecha_inicial.strftime("%d/%m/%Y")
         ff_str = fecha_final.strftime("%d/%m/%Y")
 
+        # Inicializamos siempre las 3 variables para evitar NameError
+        # si el bloque try falla antes de asignarlas.
+        contenido = None
+        content_type_o_error = None
+        nombre_archivo = None
+        error_conexion = None
+
         with st.spinner(f"Descargando medidores de generación {fi_str} – {ff_str} ..."):
             try:
                 contenido, content_type_o_error, nombre_archivo = descargar_medidores_generacion(
@@ -168,11 +175,18 @@ if enviado:
                     tipo=tipo,
                     formato=FORMATOS[formato_label],
                 )
+            except requests.exceptions.Timeout:
+                error_conexion = (
+                    "El portal del COES tardó demasiado en responder (timeout). "
+                    "El reporte puede tardar más para rangos de fechas largos; "
+                    "intenta un rango más corto o vuelve a intentarlo más tarde."
+                )
             except requests.exceptions.RequestException as exc:
-                st.error(f"Error de conexión con el portal del COES: {exc}")
-                contenido = None
+                error_conexion = f"Error de conexión con el portal del COES: {exc}"
 
-        if contenido is None and content_type_o_error is not None:
+        if error_conexion:
+            st.error(error_conexion)
+        elif contenido is None and content_type_o_error is not None:
             # content_type_o_error contiene el mensaje de error (caso JSON inesperado)
             st.warning(content_type_o_error)
         elif contenido is not None:
@@ -183,3 +197,5 @@ if enviado:
                 file_name=nombre_archivo,
                 mime=content_type_o_error or "application/octet-stream",
             )
+        else:
+            st.error("No se pudo obtener el archivo por un motivo desconocido.")
