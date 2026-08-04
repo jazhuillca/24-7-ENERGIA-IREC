@@ -18,9 +18,6 @@ import streamlit as st
 # ─────────────────────────────────────────────────────────────
 #  CONSTANTES DEL ENDPOINT / FORMULARIO (extraídas del HTML real)
 # ─────────────────────────────────────────────────────────────
-URL_PAGINA   = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion"
-URL_EXPORTAR = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/exportar"
-
 TIPOS_GENERACION = {
     "EÓLICA": "4",
     "HIDROELÉCTRICA": "1",
@@ -181,6 +178,18 @@ FORMATOS = {
 
 FORMATO_EXTENSION = {"1": "xlsx", "2": "xlsx", "3": "csv"}
 
+URL_PAGINA          = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion"
+URL_VALIDAR_EXPORT  = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/validarexportacion"
+URL_EXPORTAR        = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/exportar"
+URL_DESCARGAR       = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/descargar"
+
+MENSAJES_VALIDACION = {
+    2: "El lapso de tiempo no puede ser mayor a 1 mes.",
+    3: "Para la exportación a CSV solo debe seleccionar un parámetro.",
+    4: "Seleccione un parámetro a exportar.",
+    -1: "Ha ocurrido un error en el servidor al validar la exportación.",
+}
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -193,13 +202,10 @@ HEADERS = {
 }
 
 
-# ─────────────────────────────────────────────────────────────
-#  LÓGICA DE DESCARGA (misma que el script standalone)
-# ─────────────────────────────────────────────────────────────
 def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update(HEADERS)
-    s.get(URL_PAGINA, timeout=30)
+    s.get(URL_PAGINA, timeout=30)  # cookies de sesión
     return s
 
 
@@ -219,64 +225,89 @@ def descargar_medidores_generacion(
     central: str,
     parametros: str,
     tipo: str,
+    tipos_empresa: str = "",
 ):
     """
+    Replica el flujo real del sitio (medidores.js -> exportarFormato):
+      1) POST validarexportacion
+      2) POST exportar
+      3) GET descargar?tipo=...
+
     Devuelve (contenido_bytes, nombre_archivo, mensaje_error).
     """
     s = _session()
 
-    payload = {
+    # ── Paso 1: validar ─────────────────────────────────────────
+    payload_validar = {
+        "formato": tipo,
         "fechaInicial": fecha_inicial,
         "fechaFinal": fecha_final,
+        "parametros": parametros,
+    }
+    try:
+        resp1 = s.post(URL_VALIDAR_EXPORT, data=payload_validar, timeout=60)
+    except requests.RequestException as e:
+        return None, None, f"Error de conexión en validarexportacion: {e}"
+
+    if resp1.status_code != 200:
+        return None, None, f"HTTP {resp1.status_code} en validarexportacion: {resp1.text[:300]}"
+
+    try:
+        resultado_validar = resp1.json()
+    except ValueError:
+        return None, None, f"Respuesta inesperada en validarexportacion: {resp1.text[:300]}"
+
+    if resultado_validar != 1:
+        mensaje = MENSAJES_VALIDACION.get(
+            resultado_validar, f"Validación falló con código {resultado_validar!r}"
+        )
+        return None, None, mensaje
+
+    # ── Paso 2: exportar (genera el archivo en la sesión del servidor) ──
+    payload_exportar = {
+        "fechaInicial": fecha_inicial,
+        "fechaFinal": fecha_final,
+        "tiposEmpresa": tipos_empresa,
         "empresas": empresas,
         "tiposGeneracion": tipos_generacion,
         "central": central,
         "parametros": parametros,
         "tipo": tipo,
     }
+    try:
+        resp2 = s.post(URL_EXPORTAR, data=payload_exportar, timeout=90)
+    except requests.RequestException as e:
+        return None, None, f"Error de conexión en exportar: {e}"
+
+    if resp2.status_code != 200:
+        return None, None, f"HTTP {resp2.status_code} en exportar: {resp2.text[:300]}"
 
     try:
-        resp = s.post(URL_EXPORTAR, data=payload, timeout=90)
+        resultado_exportar = resp2.json()
+    except ValueError:
+        return None, None, f"Respuesta inesperada en exportar: {resp2.text[:300]}"
+
+    if str(resultado_exportar) != "1":
+        return None, None, f"exportar devolvió un error: {resultado_exportar!r}"
+
+    # ── Paso 3: descargar el archivo ya generado ────────────────
+    try:
+        resp3 = s.get(URL_DESCARGAR, params={"tipo": tipo}, timeout=90)
     except requests.RequestException as e:
-        return None, None, f"Error de conexión: {e}"
+        return None, None, f"Error de conexión en descargar: {e}"
 
-    if resp.status_code != 200:
-        return None, None, f"HTTP {resp.status_code}: {resp.text[:300]}"
+    if resp3.status_code != 200:
+        return None, None, f"HTTP {resp3.status_code} en descargar: {resp3.text[:300]}"
 
-    content_type = resp.headers.get("Content-Type", "")
     ext_default = FORMATO_EXTENSION.get(tipo, "xlsx")
     nombre_default = (
         f"MedidoresGeneracion_{fecha_inicial.replace('/', '')}_"
         f"{fecha_final.replace('/', '')}.{ext_default}"
     )
+    nombre = _nombre_desde_content_disposition(resp3, default=nombre_default)
+    nombre = unicodedata.normalize("NFKD", nombre).encode("ascii", "ignore").decode()
 
-    # Caso A: respuesta binaria directa
-    if "json" not in content_type.lower() and "text/html" not in content_type.lower():
-        nombre = _nombre_desde_content_disposition(resp, default=nombre_default)
-        nombre = unicodedata.normalize("NFKD", nombre).encode("ascii", "ignore").decode()
-        return resp.content, nombre, None
-
-    # Caso B: respuesta JSON -> segundo GET
-    try:
-        data = resp.json()
-    except ValueError:
-        return None, None, f"Respuesta inesperada (no binaria ni JSON): {resp.text[:300]}"
-
-    url_archivo = data.get("archivo") or data.get("Url") or data.get("url") or data.get("ruta")
-    if not url_archivo:
-        return None, None, f"JSON sin campo de archivo reconocible: {data}"
-
-    if not url_archivo.startswith("http"):
-        url_archivo = "https://www.coes.org.pe" + (
-            url_archivo if url_archivo.startswith("/") else "/" + url_archivo
-        )
-
-    resp2 = s.get(url_archivo, timeout=90)
-    if resp2.status_code != 200:
-        return None, None, f"HTTP {resp2.status_code} al descargar archivo final"
-
-    nombre = _nombre_desde_content_disposition(resp2, default=Path(url_archivo).name)
-    return resp2.content, nombre, None
+    return resp3.content, nombre, None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -294,6 +325,7 @@ st.caption("Descarga directa desde el portal COES (mediciones/medidoresgeneracio
 # dejarlos sueltos, cada clic dispara un rerun inmediato.
 
 st.subheader("Rango de fechas")
+st.caption("El portal solo permite consultar hasta 1 mes por descarga.")
 col1, col2 = st.columns(2)
 with col1:
     fecha_inicial = st.date_input("Fecha inicial", value=date.today().replace(day=1))
