@@ -287,65 +287,70 @@ st.set_page_config(page_title="Medidores de Generación — COES", page_icon="�
 st.title("⚡ Medidores de Generación — COES")
 st.caption("Descarga directa desde el portal COES (mediciones/medidoresgeneracion)")
 
-with st.form("filtros_form"):
+# IMPORTANTE: estos filtros van FUERA de un st.form a propósito.
+# Dentro de un st.form, Streamlit no vuelve a ejecutar el script hasta
+# que se presiona el botón de submit, así que un checkbox "TODOS" no
+# podría habilitar/deshabilitar el multiselect en tiempo real. Al
+# dejarlos sueltos, cada clic dispara un rerun inmediato.
 
-    st.subheader("Rango de fechas")
-    col1, col2 = st.columns(2)
-    with col1:
-        fecha_inicial = st.date_input("Fecha inicial", value=date.today().replace(day=1))
-    with col2:
-        fecha_final = st.date_input("Fecha final", value=date.today())
+st.subheader("Rango de fechas")
+col1, col2 = st.columns(2)
+with col1:
+    fecha_inicial = st.date_input("Fecha inicial", value=date.today().replace(day=1))
+with col2:
+    fecha_final = st.date_input("Fecha final", value=date.today())
 
-    st.divider()
-    st.subheader(f"Empresa ({len(EMPRESAS)} agentes)")
-    todos_empresas = st.checkbox("TODOS los agentes", value=True, key="chk_empresas")
-    empresas_sel = st.multiselect(
-        "Selecciona empresa(s)",
-        options=sorted(EMPRESAS.keys()),
-        default=[],
-        disabled=todos_empresas,
-        help="Escribe para filtrar por nombre.",
-    )
+st.divider()
+st.subheader(f"Empresa ({len(EMPRESAS)} agentes)")
+todos_empresas = st.checkbox("TODOS los agentes", value=True, key="chk_empresas")
+empresas_sel = st.multiselect(
+    "Selecciona empresa(s)",
+    options=sorted(EMPRESAS.keys()),
+    default=[],
+    disabled=todos_empresas,
+    help="Escribe para filtrar por nombre.",
+)
 
-    st.divider()
-    st.subheader("Tipo de Generación")
-    todos_tipo_gen = st.checkbox("TODOS los tipos", value=True, key="chk_tipo_gen")
-    tipo_gen_sel = st.multiselect(
-        "Selecciona tipo(s) de generación",
-        options=list(TIPOS_GENERACION.keys()),
-        default=list(TIPOS_GENERACION.keys()),
-        disabled=todos_tipo_gen,
-    )
+st.divider()
+st.subheader("Tipo de Generación")
+todos_tipo_gen = st.checkbox("TODOS los tipos", value=True, key="chk_tipo_gen")
+tipo_gen_sel = st.multiselect(
+    "Selecciona tipo(s) de generación",
+    options=list(TIPOS_GENERACION.keys()),
+    default=list(TIPOS_GENERACION.keys()),
+    disabled=todos_tipo_gen,
+)
 
-    st.divider()
-    st.subheader("Central / Alcance")
-    central_sel = st.radio(
-        "Filtro de central",
-        options=list(CENTRAL_OPCIONES.keys()),
-        index=0,  # TODOS
-        horizontal=True,
-    )
+st.divider()
+st.subheader("Central / Alcance")
+central_sel = st.radio(
+    "Filtro de central",
+    options=list(CENTRAL_OPCIONES.keys()),
+    index=0,  # TODOS
+    horizontal=True,
+)
 
-    st.divider()
-    st.subheader("Parámetro (a exportar)")
-    todos_parametros = st.checkbox("TODOS los parámetros", value=True, key="chk_param")
-    parametros_sel = st.multiselect(
-        "Selecciona parámetro(s)",
-        options=list(PARAMETROS_EXPORTAR.keys()),
-        default=list(PARAMETROS_EXPORTAR.keys()),
-        disabled=todos_parametros,
-    )
+st.divider()
+st.subheader("Parámetro (a exportar)")
+todos_parametros = st.checkbox("TODOS los parámetros", value=True, key="chk_param")
+parametros_sel = st.multiselect(
+    "Selecciona parámetro(s)",
+    options=list(PARAMETROS_EXPORTAR.keys()),
+    default=list(PARAMETROS_EXPORTAR.keys()),
+    disabled=todos_parametros,
+)
 
-    st.divider()
-    st.subheader("Formato de salida")
-    formato_sel = st.radio(
-        "Formato",
-        options=list(FORMATOS.keys()),
-        index=0,  # Excel Horizontal
-        horizontal=True,
-    )
+st.divider()
+st.subheader("Formato de salida")
+formato_sel = st.radio(
+    "Formato",
+    options=list(FORMATOS.keys()),
+    index=0,  # Excel Horizontal
+    horizontal=True,
+)
 
-    submitted = st.form_submit_button("📥 Descargar", use_container_width=True)
+st.divider()
+submitted = st.button("📥 Descargar", use_container_width=True, type="primary")
 
 
 if submitted:
@@ -355,6 +360,12 @@ if submitted:
 
     if not todos_empresas and not empresas_sel:
         st.error("Selecciona al menos una empresa (o marca TODOS los agentes).")
+        st.stop()
+    if not todos_tipo_gen and not tipo_gen_sel:
+        st.error("Selecciona al menos un tipo de generación (o marca TODOS).")
+        st.stop()
+    if not todos_parametros and not parametros_sel:
+        st.error("Selecciona al menos un parámetro (o marca TODOS).")
         st.stop()
 
     # Construir valores del payload a partir de la selección del usuario
@@ -381,13 +392,6 @@ if submitted:
     )
 
     formato_val = FORMATOS[formato_sel]
-
-    if not todos_tipo_gen and not tipo_gen_sel:
-        st.error("Selecciona al menos un tipo de generación (o marca TODOS).")
-        st.stop()
-    if not todos_parametros and not parametros_sel:
-        st.error("Selecciona al menos un parámetro (o marca TODOS).")
-        st.stop()
 
     with st.spinner("Consultando el portal COES..."):
         contenido, nombre, error = descargar_medidores_generacion(
