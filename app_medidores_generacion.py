@@ -3,15 +3,20 @@
 Streamlit — Descarga de "Medidores de Generación" (COES)
 
 Ejecutar:
-    pip install streamlit requests
+    pip install streamlit requests pandas openpyxl
     streamlit run app_medidores_generacion.py
 """
 
+import io
 import re
+import time
 import unicodedata
+from calendar import monthrange
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 
+import pandas as pd
 import requests
 import streamlit as st
 
@@ -310,6 +315,34 @@ def descargar_medidores_generacion(
     return resp3.content, nombre, None
 
 
+def dividir_en_meses(fecha_inicio: date, fecha_fin: date):
+    """
+    Divide [fecha_inicio, fecha_fin] en tramos que respetan el límite de
+    1 mes que exige el servidor. Cada tramo va del día de inicio hasta el
+    mismo día del mes siguiente menos uno (o el fin real, lo que sea antes).
+    """
+    tramos = []
+    actual = fecha_inicio
+    while actual <= fecha_fin:
+        # Fin de tramo: mismo día un mes después, menos 1 día
+        mes = actual.month + 1
+        anio = actual.year
+        if mes > 12:
+            mes = 1
+            anio += 1
+        ultimo_dia_mes_destino = monthrange(anio, mes)[1]
+        dia = min(actual.day, ultimo_dia_mes_destino)
+        fin_tramo = date(anio, mes, dia) - timedelta(days=1)
+
+        if fin_tramo > fecha_fin:
+            fin_tramo = fecha_fin
+
+        tramos.append((actual, fin_tramo))
+        actual = fin_tramo + timedelta(days=1)
+
+    return tramos
+
+
 # ─────────────────────────────────────────────────────────────
 #  INTERFAZ STREAMLIT
 # ─────────────────────────────────────────────────────────────
@@ -325,7 +358,10 @@ st.caption("Descarga directa desde el portal COES (mediciones/medidoresgeneracio
 # dejarlos sueltos, cada clic dispara un rerun inmediato.
 
 st.subheader("Rango de fechas")
-st.caption("El portal solo permite consultar hasta 1 mes por descarga.")
+st.caption(
+    "El portal solo permite consultar 1 mes por request; si eliges un rango "
+    "mayor, la app descarga mes por mes y consolida todo en un solo Excel."
+)
 col1, col2 = st.columns(2)
 with col1:
     fecha_inicial = st.date_input("Fecha inicial", value=date.today().replace(day=1))
@@ -382,6 +418,10 @@ formato_sel = st.radio(
 )
 
 st.divider()
+with st.expander("⚙️ Opciones avanzadas", expanded=False):
+    max_workers = st.slider("Descargas en paralelo (para rangos >1 mes)", 1, 6, 3)
+
+st.divider()
 submitted = st.button("📥 Descargar", use_container_width=True, type="primary")
 
 
@@ -425,24 +465,133 @@ if submitted:
 
     formato_val = FORMATOS[formato_sel]
 
-    with st.spinner("Consultando el portal COES..."):
-        contenido, nombre, error = descargar_medidores_generacion(
-            fecha_inicial=fecha_inicial.strftime("%d/%m/%Y"),
-            fecha_final=fecha_final.strftime("%d/%m/%Y"),
-            empresas=empresas_val,
-            tipos_generacion=tipo_gen_val,
-            central=central_val,
-            parametros=parametros_val,
-            tipo=formato_val,
+    tramos = dividir_en_meses(fecha_inicial, fecha_final)
+
+    if len(tramos) == 1:
+        # Rango de 1 mes o menos: descarga directa, sin ZIP
+        with st.spinner("Consultando el portal COES..."):
+            contenido, nombre, error = descargar_medidores_generacion(
+                fecha_inicial=fecha_inicial.strftime("%d/%m/%Y"),
+                fecha_final=fecha_final.strftime("%d/%m/%Y"),
+                empresas=empresas_val,
+                tipos_generacion=tipo_gen_val,
+                central=central_val,
+                parametros=parametros_val,
+                tipo=formato_val,
+            )
+
+        if error:
+            st.error(f"No se pudo descargar: {error}")
+        else:
+            st.success(f"Listo — {nombre}")
+            st.download_button(
+                "⬇️ Guardar archivo",
+                data=contenido,
+                file_name=nombre,
+                use_container_width=True,
+            )
+
+    else:
+        # Rango mayor a 1 mes: el servidor solo acepta 1 mes por request,
+        # así que se descarga tramo por tramo EN PARALELO (mismo patrón que
+        # la app de mantenimientos) y se consolida todo en un solo Excel.
+        st.info(
+            f"El rango pedido abarca {len(tramos)} meses. El portal COES solo "
+            f"permite descargar 1 mes a la vez, así que se descargarán en "
+            f"paralelo ({max_workers} a la vez) y se consolidará todo en un "
+            f"solo archivo."
         )
 
-    if error:
-        st.error(f"No se pudo descargar: {error}")
-    else:
-        st.success(f"Listo — {nombre}")
-        st.download_button(
-            "⬇️ Guardar archivo",
-            data=contenido,
-            file_name=nombre,
-            use_container_width=True,
-        )
+        def _descargar_y_leer(ini, fin):
+            rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
+            contenido, nombre, error = descargar_medidores_generacion(
+                fecha_inicial=ini.strftime("%d/%m/%Y"),
+                fecha_final=fin.strftime("%d/%m/%Y"),
+                empresas=empresas_val,
+                tipos_generacion=tipo_gen_val,
+                central=central_val,
+                parametros=parametros_val,
+                tipo=formato_val,
+            )
+            if error:
+                raise RuntimeError(error)
+
+            if formato_val == "3":  # CSV
+                df = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python")
+            else:  # Excel Horizontal o Vertical
+                df = pd.read_excel(io.BytesIO(contenido))
+            df.insert(0, "Tramo_Consultado", rango_str)
+            return df
+
+        progreso = st.progress(0.0)
+        estado = st.empty()
+        t0 = time.time()
+
+        dataframes = []
+        errores = []  # (rango_str, mensaje)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_descargar_y_leer, ini, fin): (ini, fin)
+                for ini, fin in tramos
+            }
+
+            done = 0
+            for future in as_completed(futures):
+                ini, fin = futures[future]
+                rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
+                try:
+                    dataframes.append(future.result())
+                except Exception as e:
+                    errores.append((rango_str, str(e)))
+                done += 1
+                progreso.progress(done / len(tramos))
+                estado.text(f"Procesados {done}/{len(tramos)} — último: {rango_str}")
+
+        elapsed = time.time() - t0
+        estado.empty()
+        progreso.empty()
+        st.caption(f"⏱️ Tiempo total: {elapsed:.1f} s ({len(tramos)} tramo(s), {max_workers} en paralelo)")
+
+        if errores:
+            with st.expander(f"⚠️ {len(errores)} tramo(s) fallaron", expanded=True):
+                for rango_str, msg in errores:
+                    st.write(f"- **{rango_str}**: {msg}")
+
+        if dataframes:
+            df_final = pd.concat(dataframes, ignore_index=True)
+
+            st.success(
+                f"Listo — {len(dataframes)} de {len(tramos)} tramos consolidados "
+                f"({len(df_final):,} filas en total)."
+            )
+            st.dataframe(df_final.head(300), use_container_width=True)
+
+            nombre_base = (
+                f"MedidoresGeneracion_{fecha_inicial.strftime('%Y%m%d')}_"
+                f"{fecha_final.strftime('%Y%m%d')}_consolidado"
+            )
+
+            # Descarga xlsx
+            buf_xlsx = io.BytesIO()
+            with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as writer:
+                df_final.to_excel(writer, index=False, sheet_name="MedidoresGeneracion")
+            st.download_button(
+                "⬇️ Descargar Excel consolidado",
+                data=buf_xlsx.getvalue(),
+                file_name=f"{nombre_base}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+            # Descarga csv
+            buf_csv = df_final.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "⬇️ Descargar CSV consolidado",
+                data=buf_csv,
+                file_name=f"{nombre_base}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.error("No se pudo descargar ningún tramo.")
