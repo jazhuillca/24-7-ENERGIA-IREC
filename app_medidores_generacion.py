@@ -15,6 +15,7 @@ from calendar import monthrange
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
+from threading import Lock
 
 import pandas as pd
 import requests
@@ -206,6 +207,22 @@ HEADERS = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
 }
 
+# ─────────────────────────────────────────────────────────────
+#  LOCK GLOBAL para el tramo crítico exportar->descargar.
+#
+#  El servidor de COES genera el archivo en el paso "exportar" y
+#  lo entrega en el paso "descargar" (aparentemente usando algo
+#  ligado a la sesión/carpeta temporal en el servidor, no 100%
+#  aislado por request). Si dos hilos hacen "exportar" casi al
+#  mismo tiempo, uno puede sobreescribir el archivo del otro antes
+#  de que este lo descargue -> tramos con datos equivocados, vacíos
+#  o corruptos, de forma no determinística.
+#
+#  Serializamos SOLO ese tramo crítico (no toda la descarga) para
+#  seguir aprovechando paralelismo en el resto del flujo.
+# ─────────────────────────────────────────────────────────────
+_export_lock = Lock()
+
 
 def _session() -> requests.Session:
     s = requests.Session()
@@ -235,14 +252,14 @@ def descargar_medidores_generacion(
     """
     Replica el flujo real del sitio (medidores.js -> exportarFormato):
       1) POST validarexportacion
-      2) POST exportar
-      3) GET descargar?tipo=...
+      2) POST exportar          ─┐
+      3) GET  descargar?tipo=... ┘ SECCIÓN CRÍTICA (con lock)
 
     Devuelve (contenido_bytes, nombre_archivo, mensaje_error).
     """
     s = _session()
 
-    # ── Paso 1: validar ─────────────────────────────────────────
+    # ── Paso 1: validar (esto sí es seguro en paralelo) ─────────
     payload_validar = {
         "formato": tipo,
         "fechaInicial": fecha_inicial,
@@ -268,41 +285,46 @@ def descargar_medidores_generacion(
         )
         return None, None, mensaje
 
-    # ── Paso 2: exportar (genera el archivo en la sesión del servidor) ──
-    payload_exportar = {
-        "fechaInicial": fecha_inicial,
-        "fechaFinal": fecha_final,
-        "tiposEmpresa": tipos_empresa,
-        "empresas": empresas,
-        "tiposGeneracion": tipos_generacion,
-        "central": central,
-        "parametros": parametros,
-        "tipo": tipo,
-    }
-    try:
-        resp2 = s.post(URL_EXPORTAR, data=payload_exportar, timeout=90)
-    except requests.RequestException as e:
-        return None, None, f"Error de conexión en exportar: {e}"
+    # ── Pasos 2 y 3: exportar + descargar. Deben ser atómicos ───
+    # respecto a otros hilos, porque el servidor genera el archivo
+    # en el paso 2 y lo sirve en el paso 3.
+    with _export_lock:
+        payload_exportar = {
+            "fechaInicial": fecha_inicial,
+            "fechaFinal": fecha_final,
+            "tiposEmpresa": tipos_empresa,
+            "empresas": empresas,
+            "tiposGeneracion": tipos_generacion,
+            "central": central,
+            "parametros": parametros,
+            "tipo": tipo,
+        }
+        try:
+            resp2 = s.post(URL_EXPORTAR, data=payload_exportar, timeout=90)
+        except requests.RequestException as e:
+            return None, None, f"Error de conexión en exportar: {e}"
 
-    if resp2.status_code != 200:
-        return None, None, f"HTTP {resp2.status_code} en exportar: {resp2.text[:300]}"
+        if resp2.status_code != 200:
+            return None, None, f"HTTP {resp2.status_code} en exportar: {resp2.text[:300]}"
 
-    try:
-        resultado_exportar = resp2.json()
-    except ValueError:
-        return None, None, f"Respuesta inesperada en exportar: {resp2.text[:300]}"
+        try:
+            resultado_exportar = resp2.json()
+        except ValueError:
+            return None, None, f"Respuesta inesperada en exportar: {resp2.text[:300]}"
 
-    if str(resultado_exportar) != "1":
-        return None, None, f"exportar devolvió un error: {resultado_exportar!r}"
+        if str(resultado_exportar) != "1":
+            return None, None, f"exportar devolvió un error: {resultado_exportar!r}"
 
-    # ── Paso 3: descargar el archivo ya generado ────────────────
-    try:
-        resp3 = s.get(URL_DESCARGAR, params={"tipo": tipo}, timeout=90)
-    except requests.RequestException as e:
-        return None, None, f"Error de conexión en descargar: {e}"
+        try:
+            resp3 = s.get(URL_DESCARGAR, params={"tipo": tipo}, timeout=90)
+        except requests.RequestException as e:
+            return None, None, f"Error de conexión en descargar: {e}"
 
     if resp3.status_code != 200:
         return None, None, f"HTTP {resp3.status_code} en descargar: {resp3.text[:300]}"
+
+    if not resp3.content or len(resp3.content) < 100:
+        return None, None, "El servidor devolvió un archivo vacío o demasiado pequeño."
 
     ext_default = FORMATO_EXTENSION.get(tipo, "xlsx")
     nombre_default = (
@@ -343,6 +365,87 @@ def dividir_en_meses(fecha_inicio: date, fecha_fin: date):
     return tramos
 
 
+def _descargar_y_leer(ini, fin, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val):
+    """Descarga un tramo y lo convierte a DataFrame. Lanza excepción si algo falla."""
+    rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
+    contenido, nombre, error = descargar_medidores_generacion(
+        fecha_inicial=ini.strftime("%d/%m/%Y"),
+        fecha_final=fin.strftime("%d/%m/%Y"),
+        empresas=empresas_val,
+        tipos_generacion=tipo_gen_val,
+        central=central_val,
+        parametros=parametros_val,
+        tipo=formato_val,
+    )
+    if error:
+        raise RuntimeError(error)
+
+    if formato_val == "3":  # CSV
+        df = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python")
+    else:  # Excel Horizontal o Vertical
+        df = pd.read_excel(io.BytesIO(contenido))
+
+    if df.empty:
+        raise RuntimeError("El archivo se descargó pero no contiene filas (posible mezcla de tramos).")
+
+    df.insert(0, "Tramo_Consultado", rango_str)
+    return df
+
+
+def _procesar_tramos_con_reintentos(
+    tramos, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val,
+    max_workers, max_reintentos, progreso, estado,
+):
+    """
+    Descarga todos los tramos en paralelo, y reintenta automáticamente
+    (secuencialmente, para minimizar conflictos) los que fallen, hasta
+    max_reintentos veces cada uno, antes de darlos por definitivamente
+    fallidos.
+    """
+    resultados = {}  # (ini, fin) -> DataFrame
+    pendientes = list(tramos)
+    intento = 0
+    total = len(tramos)
+
+    while pendientes and intento <= max_reintentos:
+        intento += 1
+        workers_este_intento = max_workers if intento == 1 else 1  # reintentos secuenciales, más seguros
+        fallidos_este_intento = []
+
+        with ThreadPoolExecutor(max_workers=workers_este_intento) as executor:
+            futures = {
+                executor.submit(
+                    _descargar_y_leer, ini, fin,
+                    empresas_val, tipo_gen_val, central_val, parametros_val, formato_val,
+                ): (ini, fin)
+                for ini, fin in pendientes
+            }
+
+            for future in as_completed(futures):
+                ini, fin = futures[future]
+                rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
+                try:
+                    resultados[(ini, fin)] = future.result()
+                except Exception as e:
+                    fallidos_este_intento.append((ini, fin, str(e)))
+
+                hechos = len(resultados)
+                progreso.progress(min(hechos / total, 1.0))
+                sufijo = f" (intento {intento})" if intento > 1 else ""
+                estado.text(f"Procesados {hechos}/{total} — último: {rango_str}{sufijo}")
+
+        pendientes = [(ini, fin) for ini, fin, _ in fallidos_este_intento]
+        if pendientes and intento <= max_reintentos:
+            time.sleep(2)  # pequeña pausa antes de reintentar, cortesía con el servidor
+
+    errores_finales = [
+        (f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}", "Falló tras todos los reintentos")
+        for ini, fin in pendientes
+    ]
+
+    return resultados, errores_finales
+
+
 # ─────────────────────────────────────────────────────────────
 #  INTERFAZ STREAMLIT
 # ─────────────────────────────────────────────────────────────
@@ -350,12 +453,6 @@ st.set_page_config(page_title="Medidores de Generación — COES", page_icon="�
 
 st.title("⚡ Medidores de Generación — COES")
 st.caption("Descarga directa desde el portal COES (mediciones/medidoresgeneracion)")
-
-# IMPORTANTE: estos filtros van FUERA de un st.form a propósito.
-# Dentro de un st.form, Streamlit no vuelve a ejecutar el script hasta
-# que se presiona el botón de submit, así que un checkbox "TODOS" no
-# podría habilitar/deshabilitar el multiselect en tiempo real. Al
-# dejarlos sueltos, cada clic dispara un rerun inmediato.
 
 st.subheader("Rango de fechas")
 st.caption(
@@ -419,7 +516,17 @@ formato_sel = st.radio(
 
 st.divider()
 with st.expander("⚙️ Opciones avanzadas", expanded=False):
-    max_workers = st.slider("Descargas en paralelo (para rangos >1 mes)", 1, 6, 3)
+    max_workers = st.slider(
+        "Descargas en paralelo (para rangos >1 mes)", 1, 6, 3,
+        help="Solo aplica al primer intento. Los reintentos automáticos de tramos "
+             "fallidos se hacen de forma secuencial para maximizar la confiabilidad.",
+    )
+    max_reintentos = st.slider(
+        "Reintentos automáticos por tramo fallido", 0, 5, 2,
+        help="Si un mes falla (por ejemplo por colisión entre descargas paralelas), "
+             "la app lo vuelve a intentar automáticamente hasta este número de veces "
+             "antes de reportarlo como error definitivo.",
+    )
 
 st.divider()
 submitted = st.button("📥 Descargar", use_container_width=True, type="primary")
@@ -440,10 +547,6 @@ if submitted:
         st.error("Selecciona al menos un parámetro (o marca TODOS).")
         st.stop()
 
-    # Construir valores del payload a partir de la selección del usuario
-    # Nota: el widget real del portal llama a checkAll() al cargar, es decir
-    # "TODOS" envía la lista completa de IDs separados por coma (no un código
-    # especial tipo -1, a diferencia del endpoint de mantenimientos).
     empresas_val = (
         ",".join(EMPRESAS.values()) if todos_empresas
         else ",".join(EMPRESAS[nombre] for nombre in empresas_sel)
@@ -468,7 +571,7 @@ if submitted:
     tramos = dividir_en_meses(fecha_inicial, fecha_final)
 
     if len(tramos) == 1:
-        # Rango de 1 mes o menos: descarga directa, sin ZIP
+        # Rango de 1 mes o menos: descarga directa, sin consolidar
         with st.spinner("Consultando el portal COES..."):
             contenido, nombre, error = descargar_medidores_generacion(
                 fecha_inicial=fecha_inicial.strftime("%d/%m/%Y"),
@@ -492,79 +595,54 @@ if submitted:
             )
 
     else:
-        # Rango mayor a 1 mes: el servidor solo acepta 1 mes por request,
-        # así que se descarga tramo por tramo EN PARALELO (mismo patrón que
-        # la app de mantenimientos) y se consolida todo en un solo Excel.
         st.info(
             f"El rango pedido abarca {len(tramos)} meses. El portal COES solo "
             f"permite descargar 1 mes a la vez, así que se descargarán en "
-            f"paralelo ({max_workers} a la vez) y se consolidará todo en un "
-            f"solo archivo."
+            f"paralelo ({max_workers} a la vez), reintentando automáticamente "
+            f"los tramos que fallen, y luego se consolidará todo en un solo archivo."
         )
-
-        def _descargar_y_leer(ini, fin):
-            rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
-            contenido, nombre, error = descargar_medidores_generacion(
-                fecha_inicial=ini.strftime("%d/%m/%Y"),
-                fecha_final=fin.strftime("%d/%m/%Y"),
-                empresas=empresas_val,
-                tipos_generacion=tipo_gen_val,
-                central=central_val,
-                parametros=parametros_val,
-                tipo=formato_val,
-            )
-            if error:
-                raise RuntimeError(error)
-
-            if formato_val == "3":  # CSV
-                df = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python")
-            else:  # Excel Horizontal o Vertical
-                df = pd.read_excel(io.BytesIO(contenido))
-            df.insert(0, "Tramo_Consultado", rango_str)
-            return df
 
         progreso = st.progress(0.0)
         estado = st.empty()
         t0 = time.time()
 
-        dataframes = []
-        errores = []  # (rango_str, mensaje)
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_descargar_y_leer, ini, fin): (ini, fin)
-                for ini, fin in tramos
-            }
-
-            done = 0
-            for future in as_completed(futures):
-                ini, fin = futures[future]
-                rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
-                try:
-                    dataframes.append(future.result())
-                except Exception as e:
-                    errores.append((rango_str, str(e)))
-                done += 1
-                progreso.progress(done / len(tramos))
-                estado.text(f"Procesados {done}/{len(tramos)} — último: {rango_str}")
+        resultados, errores = _procesar_tramos_con_reintentos(
+            tramos, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val,
+            max_workers, max_reintentos, progreso, estado,
+        )
 
         elapsed = time.time() - t0
         estado.empty()
         progreso.empty()
         st.caption(f"⏱️ Tiempo total: {elapsed:.1f} s ({len(tramos)} tramo(s), {max_workers} en paralelo)")
 
+        # Reordenar los DataFrames según el orden cronológico de los tramos
+        dataframes = [resultados[t] for t in tramos if t in resultados]
+
         if errores:
-            with st.expander(f"⚠️ {len(errores)} tramo(s) fallaron", expanded=True):
+            with st.expander(f"⚠️ {len(errores)} tramo(s) fallaron tras los reintentos", expanded=True):
                 for rango_str, msg in errores:
                     st.write(f"- **{rango_str}**: {msg}")
+                st.warning(
+                    "Puedes intentar descargar estos tramos individualmente cambiando "
+                    "el rango de fechas arriba, o volver a presionar 'Descargar' para "
+                    "reintentar todo el proceso."
+                )
 
         if dataframes:
             df_final = pd.concat(dataframes, ignore_index=True)
 
-            st.success(
-                f"Listo — {len(dataframes)} de {len(tramos)} tramos consolidados "
-                f"({len(df_final):,} filas en total)."
-            )
+            if len(dataframes) == len(tramos):
+                st.success(
+                    f"✅ Consolidado completo — {len(dataframes)} de {len(tramos)} tramos "
+                    f"({len(df_final):,} filas en total)."
+                )
+            else:
+                st.warning(
+                    f"Consolidado parcial — {len(dataframes)} de {len(tramos)} tramos "
+                    f"({len(df_final):,} filas en total). Revisa los tramos fallidos arriba."
+                )
+
             st.dataframe(df_final.head(300), use_container_width=True)
 
             nombre_base = (
