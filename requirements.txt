@@ -3,4 +3,8 @@ pandas
 pyarrow
 requests
 openpyxl
+io
+re
+time
+unicodedata
 
