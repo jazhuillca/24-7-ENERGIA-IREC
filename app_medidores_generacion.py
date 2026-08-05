@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 Streamlit — Descarga de "Medidores de Generación" (COES)
@@ -242,6 +241,28 @@ def _filtrar_columnas_totales(df: pd.DataFrame) -> pd.DataFrame:
     return df[columnas_mantener]
 
 
+def _aplanar_columnas_multiindice(columnas) -> list:
+    """El archivo crudo de COES trae el encabezado repartido en 4 filas
+    (10-13), que pandas lee como un MultiIndex de 4 niveles por columna.
+    Esto lo convierte en un solo nombre de columna por celda, uniendo los
+    niveles con texto real y descartando los 'Unnamed: N_level_M' que deja
+    pandas en las celdas combinadas/vacías, así como niveles repetidos que
+    vienen de celdas fusionadas verticalmente."""
+    nuevas = []
+    for tup in columnas:
+        if not isinstance(tup, tuple):
+            tup = (tup,)
+        partes = []
+        for nivel in tup:
+            texto = str(nivel).strip()
+            if texto == "" or texto.lower() == "nan" or texto.startswith("Unnamed"):
+                continue
+            if texto not in partes:  # evita duplicar texto de celdas fusionadas
+                partes.append(texto)
+        nuevas.append(" - ".join(partes) if partes else "")
+    return nuevas
+
+
 # ─────────────────────────────────────────────────────────────
 #  LOCK GLOBAL para el tramo crítico exportar->descargar.
 #
@@ -417,8 +438,18 @@ def _descargar_y_leer(ini, fin, empresas_val, tipo_gen_val, central_val, paramet
 
     if formato_val == "3":  # CSV
         df = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python")
-    else:  # Excel Horizontal o Vertical
-        df = pd.read_excel(io.BytesIO(contenido))
+    else:
+        # Excel Horizontal o Vertical: el archivo crudo de COES trae el
+        # encabezado repartido en las filas 10-13 y los datos útiles solo
+        # en las columnas B:AC. header=[9,10,11,12] son esas 4 filas en
+        # índice 0-based; todo lo que viene después (fila 14 en adelante)
+        # se toma como datos, sin importar cuántas filas tenga el mes.
+        df = pd.read_excel(
+            io.BytesIO(contenido),
+            header=[9, 10, 11, 12],
+            usecols="B:AC",
+        )
+        df.columns = _aplanar_columnas_multiindice(df.columns)
 
     if df.empty:
         raise RuntimeError("El archivo se descargó pero no contiene filas (posible mezcla de tramos).")
