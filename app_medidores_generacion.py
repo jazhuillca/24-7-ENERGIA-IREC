@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 Streamlit — Descarga de "Medidores de Generación" (COES)
@@ -208,6 +209,40 @@ HEADERS = {
 }
 
 # ─────────────────────────────────────────────────────────────
+#  COLUMNAS A EXCLUIR DEL CONSOLIDADO
+#
+#  El portal COES agrega columnas de totales/resumen en cada
+#  archivo descargado (Total Energía, Total Potencia Máxima,
+#  Total Potencia Mínima). El usuario solo quiere conservar
+#  Fecha/Hora y el resto de columnas de detalle, sin esos totales.
+# ─────────────────────────────────────────────────────────────
+COLUMNAS_EXCLUIR_KEYWORDS = [
+    "total energia",
+    "total potencia maxima",
+    "total potencia minima",
+]
+
+
+def _normalizar_texto(txt) -> str:
+    """Minúsculas y sin tildes, para comparar nombres de columna sin
+    preocuparnos por acentos/mayúsculas que pueda variar el portal."""
+    txt = unicodedata.normalize("NFKD", str(txt)).encode("ascii", "ignore").decode()
+    return txt.strip().lower()
+
+
+def _filtrar_columnas_totales(df: pd.DataFrame) -> pd.DataFrame:
+    """Elimina las columnas de totales (Total Energía, Total Potencia
+    Máxima, Total Potencia Mínima) y conserva Fecha/Hora + el resto."""
+    columnas_mantener = []
+    for col in df.columns:
+        norm = _normalizar_texto(col)
+        if any(kw in norm for kw in COLUMNAS_EXCLUIR_KEYWORDS):
+            continue
+        columnas_mantener.append(col)
+    return df[columnas_mantener]
+
+
+# ─────────────────────────────────────────────────────────────
 #  LOCK GLOBAL para el tramo crítico exportar->descargar.
 #
 #  El servidor de COES genera el archivo en el paso "exportar" y
@@ -387,6 +422,10 @@ def _descargar_y_leer(ini, fin, empresas_val, tipo_gen_val, central_val, paramet
 
     if df.empty:
         raise RuntimeError("El archivo se descargó pero no contiene filas (posible mezcla de tramos).")
+
+    # Quitar columnas de totales (Total Energía, Total Potencia Máxima,
+    # Total Potencia Mínima); nos quedamos con Fecha/Hora + el detalle.
+    df = _filtrar_columnas_totales(df)
 
     df.insert(0, "Tramo_Consultado", rango_str)
     return df
@@ -651,9 +690,20 @@ if submitted:
             )
 
             # Descarga xlsx
+            # El encabezado se ubica en la fila 13, columna C (startrow/startcol
+            # son índices 0-based en pandas: fila 13 -> 12, columna C -> 2).
+            FILA_ENCABEZADO = 12   # fila 13 en Excel
+            COLUMNA_INICIO = 2     # columna C
+
             buf_xlsx = io.BytesIO()
             with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as writer:
-                df_final.to_excel(writer, index=False, sheet_name="MedidoresGeneracion")
+                df_final.to_excel(
+                    writer,
+                    index=False,
+                    sheet_name="MedidoresGeneracion",
+                    startrow=FILA_ENCABEZADO,
+                    startcol=COLUMNA_INICIO,
+                )
             st.download_button(
                 "⬇️ Descargar Excel consolidado",
                 data=buf_xlsx.getvalue(),
