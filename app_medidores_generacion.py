@@ -208,62 +208,6 @@ HEADERS = {
 }
 
 # ─────────────────────────────────────────────────────────────
-#  COLUMNAS A EXCLUIR DEL CONSOLIDADO
-#
-#  El portal COES agrega columnas de totales/resumen en cada
-#  archivo descargado (Total Energía, Total Potencia Máxima,
-#  Total Potencia Mínima). El usuario solo quiere conservar
-#  Fecha/Hora y el resto de columnas de detalle, sin esos totales.
-# ─────────────────────────────────────────────────────────────
-COLUMNAS_EXCLUIR_KEYWORDS = [
-    "total energia",
-    "total potencia maxima",
-    "total potencia minima",
-]
-
-
-def _normalizar_texto(txt) -> str:
-    """Minúsculas y sin tildes, para comparar nombres de columna sin
-    preocuparnos por acentos/mayúsculas que pueda variar el portal."""
-    txt = unicodedata.normalize("NFKD", str(txt)).encode("ascii", "ignore").decode()
-    return txt.strip().lower()
-
-
-def _filtrar_columnas_totales(df: pd.DataFrame) -> pd.DataFrame:
-    """Elimina las columnas de totales (Total Energía, Total Potencia
-    Máxima, Total Potencia Mínima) y conserva Fecha/Hora + el resto."""
-    columnas_mantener = []
-    for col in df.columns:
-        norm = _normalizar_texto(col)
-        if any(kw in norm for kw in COLUMNAS_EXCLUIR_KEYWORDS):
-            continue
-        columnas_mantener.append(col)
-    return df[columnas_mantener]
-
-
-def _aplanar_columnas_multiindice(columnas) -> list:
-    """El archivo crudo de COES trae el encabezado repartido en 4 filas
-    (10-13), que pandas lee como un MultiIndex de 4 niveles por columna.
-    Esto lo convierte en un solo nombre de columna por celda, uniendo los
-    niveles con texto real y descartando los 'Unnamed: N_level_M' que deja
-    pandas en las celdas combinadas/vacías, así como niveles repetidos que
-    vienen de celdas fusionadas verticalmente."""
-    nuevas = []
-    for tup in columnas:
-        if not isinstance(tup, tuple):
-            tup = (tup,)
-        partes = []
-        for nivel in tup:
-            texto = str(nivel).strip()
-            if texto == "" or texto.lower() == "nan" or texto.startswith("Unnamed"):
-                continue
-            if texto not in partes:  # evita duplicar texto de celdas fusionadas
-                partes.append(texto)
-        nuevas.append(" - ".join(partes) if partes else "")
-    return nuevas
-
-
-# ─────────────────────────────────────────────────────────────
 #  LOCK GLOBAL para el tramo crítico exportar->descargar.
 #
 #  El servidor de COES genera el archivo en el paso "exportar" y
@@ -438,25 +382,11 @@ def _descargar_y_leer(ini, fin, empresas_val, tipo_gen_val, central_val, paramet
 
     if formato_val == "3":  # CSV
         df = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python")
-    else:
-        # Excel Horizontal o Vertical: el archivo crudo de COES trae el
-        # encabezado repartido en las filas 10-13 y los datos útiles solo
-        # en las columnas B:AC. header=[9,10,11,12] son esas 4 filas en
-        # índice 0-based; todo lo que viene después (fila 14 en adelante)
-        # se toma como datos, sin importar cuántas filas tenga el mes.
-        df = pd.read_excel(
-            io.BytesIO(contenido),
-            header=[9, 10, 11, 12],
-            usecols="B:AC",
-        )
-        df.columns = _aplanar_columnas_multiindice(df.columns)
+    else:  # Excel Horizontal o Vertical
+        df = pd.read_excel(io.BytesIO(contenido))
 
     if df.empty:
         raise RuntimeError("El archivo se descargó pero no contiene filas (posible mezcla de tramos).")
-
-    # Quitar columnas de totales (Total Energía, Total Potencia Máxima,
-    # Total Potencia Mínima); nos quedamos con Fecha/Hora + el detalle.
-    df = _filtrar_columnas_totales(df)
 
     df.insert(0, "Tramo_Consultado", rango_str)
     return df
@@ -721,20 +651,9 @@ if submitted:
             )
 
             # Descarga xlsx
-            # El encabezado se ubica en la fila 13, columna C (startrow/startcol
-            # son índices 0-based en pandas: fila 13 -> 12, columna C -> 2).
-            FILA_ENCABEZADO = 12   # fila 13 en Excel
-            COLUMNA_INICIO = 2     # columna C
-
             buf_xlsx = io.BytesIO()
             with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as writer:
-                df_final.to_excel(
-                    writer,
-                    index=False,
-                    sheet_name="MedidoresGeneracion",
-                    startrow=FILA_ENCABEZADO,
-                    startcol=COLUMNA_INICIO,
-                )
+                df_final.to_excel(writer, index=False, sheet_name="MedidoresGeneracion")
             st.download_button(
                 "⬇️ Descargar Excel consolidado",
                 data=buf_xlsx.getvalue(),
