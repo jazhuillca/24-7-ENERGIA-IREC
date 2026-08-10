@@ -390,18 +390,19 @@ def _parsear_vertical_coes(contenido: bytes) -> pd.DataFrame:
 
     Este formato trae un encabezado JERÁRQUICO de 4 filas (código de medidor,
     empresa, central, unidad de generación) y una fila por cada intervalo de
-    15 minutos, con una columna por cada unidad de generación. Como no todas
-    las centrales generan todos los meses, el conjunto de columnas cambia de
-    un mes a otro -- por eso, en vez de forzar una tabla ancha con columnas
-    que no siempre coinciden, esta función la convierte a formato "largo"
-    (una fila por lectura):
+    15 minutos, con una columna por cada unidad de generación.
 
-        Fecha/Hora | Medidor_ID | Empresa | Central | Unidad | Valor (MW)
+    Esta función reproduce esa misma estructura ANCHA: filas = Fecha/Hora,
+    columnas = una por cada unidad de generación, con un encabezado de 3
+    niveles (Empresa, Central, Unidad) -- igual que en COES, las centrales y
+    la empresa quedan en el encabezado, no como valores repetidos en una
+    columna.
 
-    Al consolidar varios meses así, pd.concat simplemente apila filas sin
-    importar qué centrales generaron cada mes -- cualquier central que
-    generó en algún mes del rango queda representada, y se puede filtrar
-    por la columna "Central" directamente.
+    Como no todas las centrales generan todos los meses, el conjunto de
+    columnas cambia de un mes a otro. Al consolidar varios meses con
+    pd.concat(axis=0), las columnas se UNEN automáticamente: una central que
+    no generó en un mes queda con celdas vacías ese mes, pero conserva su
+    propia columna en vez de perderse o romper la tabla.
     """
     vista = pd.read_excel(io.BytesIO(contenido), header=None)
 
@@ -423,7 +424,7 @@ def _parsear_vertical_coes(contenido: bytes) -> pd.DataFrame:
     fila_unidad = vista.iloc[fila_fecha_hora + 3]
 
     col_fecha_hora, col_total = None, None
-    columnas_unidad = []
+    col_indices, columnas = [], []
     for col_idx in range(len(fila_medidor)):
         valor = fila_medidor.iloc[col_idx]
         etiqueta = str(valor).strip().upper() if pd.notna(valor) else ""
@@ -432,15 +433,14 @@ def _parsear_vertical_coes(contenido: bytes) -> pd.DataFrame:
         elif etiqueta == "TOTAL":
             col_total = col_idx
         elif pd.notna(fila_unidad.iloc[col_idx]):
-            columnas_unidad.append((
-                col_idx,
-                fila_medidor.iloc[col_idx],
-                fila_empresa.iloc[col_idx] if pd.notna(fila_empresa.iloc[col_idx]) else None,
-                fila_central.iloc[col_idx] if pd.notna(fila_central.iloc[col_idx]) else None,
+            col_indices.append(col_idx)
+            columnas.append((
+                fila_empresa.iloc[col_idx] if pd.notna(fila_empresa.iloc[col_idx]) else "",
+                fila_central.iloc[col_idx] if pd.notna(fila_central.iloc[col_idx]) else "",
                 fila_unidad.iloc[col_idx],
             ))
 
-    if col_fecha_hora is None or not columnas_unidad:
+    if col_fecha_hora is None or not col_indices:
         raise RuntimeError(
             "No se pudieron identificar las columnas de Fecha/Hora o de "
             "unidades de generación en el archivo (formato inesperado)."
@@ -448,31 +448,17 @@ def _parsear_vertical_coes(contenido: bytes) -> pd.DataFrame:
 
     datos = vista.iloc[fila_fecha_hora + 4:].reset_index(drop=True)
     datos = datos.dropna(how="all").reset_index(drop=True)
-    fecha_hora_serie = datos.iloc[:, col_fecha_hora]
+    fecha_hora = pd.to_datetime(datos.iloc[:, col_fecha_hora], errors="coerce", dayfirst=True)
 
-    bloques = []
-    for col_idx, medidor_id, empresa, central, unidad in columnas_unidad:
-        bloques.append(pd.DataFrame({
-            "Fecha/Hora": fecha_hora_serie,
-            "Medidor_ID": medidor_id,
-            "Empresa": empresa,
-            "Central": central,
-            "Unidad": unidad,
-            "Valor (MW)": datos.iloc[:, col_idx],
-        }))
+    tabla = datos.iloc[:, col_indices].copy()
+    tabla.columns = pd.MultiIndex.from_tuples(columnas, names=["Empresa", "Central", "Unidad"])
     if col_total is not None:
-        bloques.append(pd.DataFrame({
-            "Fecha/Hora": fecha_hora_serie,
-            "Medidor_ID": None,
-            "Empresa": None,
-            "Central": "(TOTAL)",
-            "Unidad": "(TOTAL)",
-            "Valor (MW)": datos.iloc[:, col_total],
-        }))
+        tabla[("(TOTAL)", "(TOTAL)", "(TOTAL)")] = datos.iloc[:, col_total]
 
-    df_largo = pd.concat(bloques, ignore_index=True)
-    df_largo["Fecha/Hora"] = pd.to_datetime(df_largo["Fecha/Hora"], errors="coerce", dayfirst=True)
-    return df_largo.dropna(subset=["Fecha/Hora"]).reset_index(drop=True)
+    tabla.index = fecha_hora
+    tabla = tabla[tabla.index.notna()]  # descarta filas de resumen/nota al pie (sin fecha válida)
+    tabla.index.name = "Fecha/Hora"
+    return tabla.reset_index()
 
 
 def _quitar_filas_resumen_pie(df: pd.DataFrame) -> pd.DataFrame:
@@ -548,6 +534,13 @@ def _descargar_y_leer(ini, fin, empresas_val, tipo_gen_val, central_val, paramet
 
     if df.empty:
         raise RuntimeError("El archivo se descargó pero no contiene filas (posible mezcla de tramos).")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        # Formato Vertical (tabla ancha, encabezado de 3 niveles): no se le
+        # agrega Tramo_Consultado porque no calza con columnas de varios
+        # niveles, y de todas formas la columna Fecha/Hora ya identifica a
+        # qué mes pertenece cada fila.
+        return df
 
     df.insert(0, "Tramo_Consultado", rango_str)
     return df
@@ -773,6 +766,17 @@ if submitted:
 
     if dataframes:
         df_final = pd.concat(dataframes, ignore_index=True, sort=False)
+        es_formato_vertical = isinstance(df_final.columns, pd.MultiIndex)
+        if es_formato_vertical:
+            # Formato Vertical (tabla ancha): puede haber quedado más de una
+            # fila para la misma Fecha/Hora si algún tramo se reintentó y se
+            # sumó dos veces; y conviene ordenar cronológicamente.
+            col_fecha_hora = ("Fecha/Hora", "", "")
+            df_final = (
+                df_final.drop_duplicates(subset=[col_fecha_hora])
+                .sort_values(col_fecha_hora)
+                .reset_index(drop=True)
+            )
 
         if len(dataframes) == len(tramos):
             st.success(
@@ -798,7 +802,17 @@ if submitted:
         # Descarga xlsx
         buf_xlsx = io.BytesIO()
         with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as writer:
-            df_final.to_excel(writer, index=False, sheet_name="MedidoresGeneracion")
+            if es_formato_vertical:
+                # pandas no soporta escribir a Excel con columnas de varios
+                # niveles e index=False, así que Fecha/Hora se pasa a ser el
+                # índice real solo para este paso (queda igual de visible,
+                # como primera columna, pero sin duplicar información).
+                col_fecha_hora = ("Fecha/Hora", "", "")
+                df_excel = df_final.set_index(col_fecha_hora)
+                df_excel.index.name = "Fecha/Hora"
+                df_excel.to_excel(writer, index=True, sheet_name="MedidoresGeneracion")
+            else:
+                df_final.to_excel(writer, index=False, sheet_name="MedidoresGeneracion")
         st.download_button(
             "⬇️ Descargar Excel consolidado",
             data=buf_xlsx.getvalue(),
