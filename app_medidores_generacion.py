@@ -385,16 +385,116 @@ def _detectar_fila_en_vista(vista: pd.DataFrame) -> int:
     return mejor_fila
 
 
+def _parsear_vertical_coes(contenido: bytes) -> pd.DataFrame:
+    """Parser específico para el formato 'Excel Vertical' de COES.
+
+    Este formato trae un encabezado JERÁRQUICO de 4 filas (código de medidor,
+    empresa, central, unidad de generación) y una fila por cada intervalo de
+    15 minutos, con una columna por cada unidad de generación. Como no todas
+    las centrales generan todos los meses, el conjunto de columnas cambia de
+    un mes a otro -- por eso, en vez de forzar una tabla ancha con columnas
+    que no siempre coinciden, esta función la convierte a formato "largo"
+    (una fila por lectura):
+
+        Fecha/Hora | Medidor_ID | Empresa | Central | Unidad | Valor (MW)
+
+    Al consolidar varios meses así, pd.concat simplemente apila filas sin
+    importar qué centrales generaron cada mes -- cualquier central que
+    generó en algún mes del rango queda representada, y se puede filtrar
+    por la columna "Central" directamente.
+    """
+    vista = pd.read_excel(io.BytesIO(contenido), header=None)
+
+    fila_fecha_hora = None
+    for i in range(min(30, len(vista))):
+        valores = [str(v).strip().upper() for v in vista.iloc[i] if pd.notna(v)]
+        if any("FECHA/HORA" in v for v in valores):
+            fila_fecha_hora = i
+            break
+    if fila_fecha_hora is None or fila_fecha_hora + 4 >= len(vista):
+        raise RuntimeError(
+            "No se encontró la fila 'FECHA/HORA' con el encabezado jerárquico "
+            "esperado (formato Excel Vertical inesperado)."
+        )
+
+    fila_medidor = vista.iloc[fila_fecha_hora]
+    fila_empresa = vista.iloc[fila_fecha_hora + 1].ffill()
+    fila_central = vista.iloc[fila_fecha_hora + 2].ffill()
+    fila_unidad = vista.iloc[fila_fecha_hora + 3]
+
+    col_fecha_hora, col_total = None, None
+    columnas_unidad = []
+    for col_idx in range(len(fila_medidor)):
+        valor = fila_medidor.iloc[col_idx]
+        etiqueta = str(valor).strip().upper() if pd.notna(valor) else ""
+        if etiqueta == "FECHA/HORA":
+            col_fecha_hora = col_idx
+        elif etiqueta == "TOTAL":
+            col_total = col_idx
+        elif pd.notna(fila_unidad.iloc[col_idx]):
+            columnas_unidad.append((
+                col_idx,
+                fila_medidor.iloc[col_idx],
+                fila_empresa.iloc[col_idx] if pd.notna(fila_empresa.iloc[col_idx]) else None,
+                fila_central.iloc[col_idx] if pd.notna(fila_central.iloc[col_idx]) else None,
+                fila_unidad.iloc[col_idx],
+            ))
+
+    if col_fecha_hora is None or not columnas_unidad:
+        raise RuntimeError(
+            "No se pudieron identificar las columnas de Fecha/Hora o de "
+            "unidades de generación en el archivo (formato inesperado)."
+        )
+
+    datos = vista.iloc[fila_fecha_hora + 4:].reset_index(drop=True)
+    datos = datos.dropna(how="all").reset_index(drop=True)
+    fecha_hora_serie = datos.iloc[:, col_fecha_hora]
+
+    bloques = []
+    for col_idx, medidor_id, empresa, central, unidad in columnas_unidad:
+        bloques.append(pd.DataFrame({
+            "Fecha/Hora": fecha_hora_serie,
+            "Medidor_ID": medidor_id,
+            "Empresa": empresa,
+            "Central": central,
+            "Unidad": unidad,
+            "Valor (MW)": datos.iloc[:, col_idx],
+        }))
+    if col_total is not None:
+        bloques.append(pd.DataFrame({
+            "Fecha/Hora": fecha_hora_serie,
+            "Medidor_ID": None,
+            "Empresa": None,
+            "Central": "(TOTAL)",
+            "Unidad": "(TOTAL)",
+            "Valor (MW)": datos.iloc[:, col_total],
+        }))
+
+    df_largo = pd.concat(bloques, ignore_index=True)
+    df_largo["Fecha/Hora"] = pd.to_datetime(df_largo["Fecha/Hora"], errors="coerce", dayfirst=True)
+    return df_largo.dropna(subset=["Fecha/Hora"]).reset_index(drop=True)
+
+
 def _parsear_contenido_coes(contenido: bytes, formato_val: str) -> pd.DataFrame:
     """Convierte los bytes crudos (Excel o CSV) devueltos por COES en un
-    DataFrame limpio: detecta dinámicamente la fila real de encabezados (en
-    vez de asumir que es la primera) y descarta columnas líder vacías (p.ej.
-    una columna A vacía antes de los datos, como pasaba en Mantenimientos)."""
+    DataFrame limpio. El formato 'Excel Vertical' (formato_val == '2') usa un
+    parser dedicado (_parsear_vertical_coes) porque tiene un encabezado
+    jerárquico de varias filas y columnas que varían mes a mes (ver esa
+    función). Los demás formatos usan detección dinámica de la fila de
+    encabezado (en vez de asumir que es la primera) y descartan columnas
+    líder vacías (p.ej. una columna A vacía antes de los datos, como pasaba
+    en Mantenimientos). El formato 'Excel Horizontal' (formato_val == '1')
+    todavía no se verificó contra un archivo real de COES, así que por ahora
+    pasa por el camino genérico; si su estructura resulta ser distinta,
+    avisar para ajustarlo específicamente."""
+    if formato_val == "2":  # Excel Vertical
+        return _parsear_vertical_coes(contenido)
+
     if formato_val == "3":  # CSV
         vista = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python", header=None, nrows=10)
         fila_header = _detectar_fila_en_vista(vista)
         df = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python", header=fila_header)
-    else:  # Excel Horizontal o Vertical
+    else:  # Excel Horizontal (formato_val == "1")
         vista = pd.read_excel(io.BytesIO(contenido), header=None, nrows=10)
         fila_header = _detectar_fila_en_vista(vista)
         df = pd.read_excel(io.BytesIO(contenido), header=fila_header)
