@@ -12,7 +12,6 @@ import re
 import time
 import unicodedata
 from calendar import monthrange
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 from threading import Lock
@@ -320,6 +319,14 @@ def descargar_medidores_generacion(
         except requests.RequestException as e:
             return None, None, f"Error de conexión en descargar: {e}"
 
+        # El servidor de COES usa un único archivo fijo en disco para armar
+        # este reporte (no uno por sesión) -- el mensaje de error observado,
+        # "Error saving file D:\...\ReporteMedidores_Vertical.xlsx", confirma
+        # que puede seguir escribiendo ese archivo en segundo plano después de
+        # responder. Esta pequeña pausa (todavía dentro del lock) le da tiempo
+        # a terminar antes de que el siguiente hilo intente exportar de nuevo.
+        time.sleep(1.5)
+
     if resp3.status_code != 200:
         return None, None, f"HTTP {resp3.status_code} en descargar: {resp3.text[:300]}"
 
@@ -546,58 +553,52 @@ def _descargar_y_leer(ini, fin, empresas_val, tipo_gen_val, central_val, paramet
     return df
 
 
-def _procesar_tramos_con_reintentos(
+def _procesar_tramos_secuencial(
     tramos, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val,
-    max_workers, max_reintentos, progreso, estado,
+    max_reintentos, progreso, estado,
 ):
     """
-    Descarga todos los tramos en paralelo, y reintenta automáticamente
-    (secuencialmente, para minimizar conflictos) los que fallen, hasta
-    max_reintentos veces cada uno, antes de darlos por definitivamente
-    fallidos.
+    Descarga cada mes UNO A LA VEZ (nada de hilos/paralelismo): se pide el
+    archivo, se convierte a DataFrame apenas llega, y se guarda en una lista.
+    Al final, todos los DataFrames se unen con pd.concat en un solo
+    consolidado.
+
+    Se hace estrictamente secuencial -y no en paralelo- porque el servidor de
+    COES arma este reporte usando un único archivo fijo en disco (no uno por
+    sesión): pedir varios meses al mismo tiempo hace que se pisen entre sí
+    ('Error saving file...' / HTTP 500). Descargar de a uno es más lento,
+    pero elimina ese choque de raíz en vez de solo mitigarlo.
     """
-    resultados = {}  # (ini, fin) -> DataFrame
-    pendientes = list(tramos)
-    intento = 0
+    dataframes = []
+    errores = []
     total = len(tramos)
 
-    while pendientes and intento <= max_reintentos:
-        intento += 1
-        workers_este_intento = max_workers if intento == 1 else 1  # reintentos secuenciales, más seguros
-        fallidos_este_intento = []
+    for i, (ini, fin) in enumerate(tramos, start=1):
+        rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
+        df_mes = None
+        ultimo_error = None
 
-        with ThreadPoolExecutor(max_workers=workers_este_intento) as executor:
-            futures = {
-                executor.submit(
-                    _descargar_y_leer, ini, fin,
-                    empresas_val, tipo_gen_val, central_val, parametros_val, formato_val,
-                ): (ini, fin)
-                for ini, fin in pendientes
-            }
+        for intento in range(max_reintentos + 1):
+            sufijo = f" (reintento {intento}/{max_reintentos})" if intento else ""
+            estado.text(f"Descargando {i}/{total} ({rango_str}){sufijo}...")
+            try:
+                df_mes = _descargar_y_leer(
+                    ini, fin, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val,
+                )
+                break
+            except Exception as e:
+                ultimo_error = str(e)
+                if intento < max_reintentos:
+                    time.sleep(2 * (intento + 1))  # pausa creciente antes de reintentar
 
-            for future in as_completed(futures):
-                ini, fin = futures[future]
-                rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
-                try:
-                    resultados[(ini, fin)] = future.result()
-                except Exception as e:
-                    fallidos_este_intento.append((ini, fin, str(e)))
+        if df_mes is not None:
+            dataframes.append(df_mes)
+        else:
+            errores.append((rango_str, f"Falló tras {max_reintentos + 1} intento(s). Último error: {ultimo_error}"))
 
-                hechos = len(resultados)
-                progreso.progress(min(hechos / total, 1.0))
-                sufijo = f" (intento {intento})" if intento > 1 else ""
-                estado.text(f"Procesados {hechos}/{total} — último: {rango_str}{sufijo}")
+        progreso.progress(i / total)
 
-        pendientes = [(ini, fin) for ini, fin, _ in fallidos_este_intento]
-        if pendientes and intento <= max_reintentos:
-            time.sleep(2)  # pequeña pausa antes de reintentar, cortesía con el servidor
-
-    errores_finales = [
-        (f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}", "Falló tras todos los reintentos")
-        for ini, fin in pendientes
-    ]
-
-    return resultados, errores_finales
+    return dataframes, errores
 
 
 # ─────────────────────────────────────────────────────────────
@@ -670,17 +671,19 @@ formato_sel = st.radio(
 
 st.divider()
 with st.expander("⚙️ Opciones avanzadas", expanded=False):
-    max_workers = st.slider(
-        "Descargas en paralelo (para rangos >1 mes)", 1, 6, 3,
-        help="Solo aplica al primer intento. Los reintentos automáticos de tramos "
-             "fallidos se hacen de forma secuencial para maximizar la confiabilidad.",
+    st.caption(
+        "Las descargas de varios meses se piden una por una (nunca en paralelo), "
+        "porque el servidor de COES arma este reporte en un único archivo fijo en "
+        "disco -no uno por sesión- y pedir varios meses al mismo tiempo los hace "
+        "chocar entre sí (error 'Error saving file...' o HTTP 500)."
     )
     max_reintentos = st.slider(
         "Reintentos automáticos por tramo fallido", 0, 5, 2,
-        help="Si un mes falla (por ejemplo por colisión entre descargas paralelas), "
+        help="Si un mes falla (por ejemplo por un error temporal del servidor), "
              "la app lo vuelve a intentar automáticamente hasta este número de veces "
              "antes de reportarlo como error definitivo.",
     )
+
 
 st.divider()
 submitted = st.button("📥 Descargar", use_container_width=True, type="primary")
@@ -729,30 +732,32 @@ if submitted:
     else:
         st.info(
             f"El rango pedido abarca {len(tramos)} meses. El portal COES solo "
-            f"permite descargar 1 mes a la vez, así que se descargarán en "
-            f"paralelo ({max_workers} a la vez), reintentando automáticamente "
-            f"los tramos que fallen, y luego se consolidará todo en un solo archivo."
+            f"permite descargar 1 mes a la vez, así que se descargarán uno por "
+            f"uno (no en paralelo, para evitar choques del lado del servidor), "
+            f"convirtiendo cada uno a DataFrame apenas llega, reintentando "
+            f"automáticamente los que fallen, y al final se unen todos en un "
+            f"solo consolidado."
         )
 
     progreso = st.progress(0.0)
     estado = st.empty()
     t0 = time.time()
 
-    # Se usa el mismo flujo sin importar si es 1 tramo o varios: así siempre
-    # se arma un DataFrame consolidado (antes, con 1 solo mes, la app se
-    # limitaba a ofrecer el archivo crudo sin parsear nada).
-    resultados, errores = _procesar_tramos_con_reintentos(
+    # Cada mes se descarga uno a la vez, se convierte a DataFrame de inmediato,
+    # y se junta a una lista; recién al final se unen todos con pd.concat.
+    # Antes esto se hacía con varios hilos en paralelo, pero el servidor de
+    # COES arma el reporte en un único archivo fijo en disco (no uno por
+    # sesión) y eso hacía que las descargas paralelas chocaran entre sí.
+    dataframes, errores = _procesar_tramos_secuencial(
         tramos, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val,
-        max_workers, max_reintentos, progreso, estado,
+        max_reintentos, progreso, estado,
     )
 
     elapsed = time.time() - t0
     estado.empty()
     progreso.empty()
-    st.caption(f"⏱️ Tiempo total: {elapsed:.1f} s ({len(tramos)} tramo(s), {max_workers} en paralelo)")
+    st.caption(f"⏱️ Tiempo total: {elapsed:.1f} s ({len(tramos)} tramo(s), secuencial)")
 
-    # Reordenar los DataFrames según el orden cronológico de los tramos
-    dataframes = [resultados[t] for t in tramos if t in resultados]
 
     if errores:
         with st.expander(f"⚠️ {len(errores)} tramo(s) fallaron tras los reintentos", expanded=True):
