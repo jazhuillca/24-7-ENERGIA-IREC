@@ -475,18 +475,37 @@ def _parsear_vertical_coes(contenido: bytes) -> pd.DataFrame:
     return df_largo.dropna(subset=["Fecha/Hora"]).reset_index(drop=True)
 
 
+def _quitar_filas_resumen_pie(df: pd.DataFrame) -> pd.DataFrame:
+    """Los reportes de COES suelen traer, después de los datos reales de cada
+    mes, un bloque de resumen y una nota al pie ('TOTAL ENERGÍA (MWh)',
+    'TOTAL POTENCIA MÁXIMA (MW)', 'TOTAL POTENCIA MÍNIMA (MW)', 'Leyenda',
+    '(*) Incluye a las centrales...'). Esas filas no son lecturas reales y
+    quedan mezcladas con los datos si no se filtran. Se identifican porque no
+    tienen una fecha válida en la columna 'FECHA' (tienen texto en su lugar),
+    así que se descartan buscando esa columna y quedándose solo con las filas
+    donde sí se puede interpretar como fecha."""
+    col_fecha = next((c for c in df.columns if str(c).strip().upper() == "FECHA"), None)
+    if col_fecha is None:
+        return df
+    fechas = pd.to_datetime(df[col_fecha], errors="coerce", dayfirst=True)
+    return df[fechas.notna()].reset_index(drop=True)
+
+
 def _parsear_contenido_coes(contenido: bytes, formato_val: str) -> pd.DataFrame:
     """Convierte los bytes crudos (Excel o CSV) devueltos por COES en un
-    DataFrame limpio. El formato 'Excel Vertical' (formato_val == '2') usa un
-    parser dedicado (_parsear_vertical_coes) porque tiene un encabezado
-    jerárquico de varias filas y columnas que varían mes a mes (ver esa
-    función). Los demás formatos usan detección dinámica de la fila de
-    encabezado (en vez de asumir que es la primera) y descartan columnas
-    líder vacías (p.ej. una columna A vacía antes de los datos, como pasaba
-    en Mantenimientos). El formato 'Excel Horizontal' (formato_val == '1')
-    todavía no se verificó contra un archivo real de COES, así que por ahora
-    pasa por el camino genérico; si su estructura resulta ser distinta,
-    avisar para ajustarlo específicamente."""
+    DataFrame limpio.
+
+    - 'Excel Vertical' (formato_val == '2'): tiene un encabezado jerárquico de
+      varias filas (medidor/empresa/central/unidad) y una columna por unidad
+      de generación, que varía mes a mes. Usa el parser dedicado
+      _parsear_vertical_coes, que lo convierte a formato largo.
+    - 'Excel Horizontal' (formato_val == '1') y CSV: tienen un encabezado de
+      una sola fila (FECHA, PUNTO MEDICIÓN, EMPRESA, CENTRAL, UNIDAD, ... y
+      columnas de horario 00:15-24:00). Usan detección dinámica de la fila de
+      encabezado (por si trae metadata arriba), descartan columnas líder
+      vacías, y quitan las filas de resumen/pie de página que COES agrega
+      después de los datos reales de cada mes (_quitar_filas_resumen_pie).
+    """
     if formato_val == "2":  # Excel Vertical
         return _parsear_vertical_coes(contenido)
 
@@ -506,7 +525,8 @@ def _parsear_contenido_coes(contenido: bytes, formato_val: str) -> pd.DataFrame:
     ):
         df = df.drop(columns=df.columns[0])
 
-    return df.dropna(how="all").reset_index(drop=True)
+    df = df.dropna(how="all").reset_index(drop=True)
+    return _quitar_filas_resumen_pie(df)
 
 
 def _descargar_y_leer(ini, fin, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val):
