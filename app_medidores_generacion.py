@@ -365,6 +365,50 @@ def dividir_en_meses(fecha_inicio: date, fecha_fin: date):
     return tramos
 
 
+def _detectar_fila_en_vista(vista: pd.DataFrame) -> int:
+    """Busca, entre las primeras filas de un archivo leído sin encabezado, cuál
+    tiene más celdas que coinciden con palabras clave típicas del encabezado
+    real de un reporte de COES. Igual estrategia que se usó para el reporte de
+    Mantenimientos (dashboard_manttos.py), porque estos reportes suelen traer
+    filas de título/fecha arriba de los encabezados reales, y la cantidad de
+    esas filas puede variar."""
+    palabras_clave = (
+        "EMPRESA", "CENTRAL", "MEDIDOR", "FECHA", "PARAMETRO", "PARÁMETRO",
+        "POTENCIA", "GENERACION", "GENERACIÓN", "HORA", "TIPO",
+    )
+    mejor_fila, mejor_score = 0, -1
+    for i in range(len(vista)):
+        valores = [str(v).upper().strip() for v in vista.iloc[i] if pd.notna(v)]
+        score = sum(1 for v in valores if any(k in v for k in palabras_clave))
+        if score > mejor_score:
+            mejor_score, mejor_fila = score, i
+    return mejor_fila
+
+
+def _parsear_contenido_coes(contenido: bytes, formato_val: str) -> pd.DataFrame:
+    """Convierte los bytes crudos (Excel o CSV) devueltos por COES en un
+    DataFrame limpio: detecta dinámicamente la fila real de encabezados (en
+    vez de asumir que es la primera) y descarta columnas líder vacías (p.ej.
+    una columna A vacía antes de los datos, como pasaba en Mantenimientos)."""
+    if formato_val == "3":  # CSV
+        vista = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python", header=None, nrows=10)
+        fila_header = _detectar_fila_en_vista(vista)
+        df = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python", header=fila_header)
+    else:  # Excel Horizontal o Vertical
+        vista = pd.read_excel(io.BytesIO(contenido), header=None, nrows=10)
+        fila_header = _detectar_fila_en_vista(vista)
+        df = pd.read_excel(io.BytesIO(contenido), header=fila_header)
+
+    while (
+        len(df.columns) > 0
+        and str(df.columns[0]).startswith("Unnamed")
+        and df[df.columns[0]].isna().all()
+    ):
+        df = df.drop(columns=df.columns[0])
+
+    return df.dropna(how="all").reset_index(drop=True)
+
+
 def _descargar_y_leer(ini, fin, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val):
     """Descarga un tramo y lo convierte a DataFrame. Lanza excepción si algo falla."""
     rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
@@ -380,10 +424,7 @@ def _descargar_y_leer(ini, fin, empresas_val, tipo_gen_val, central_val, paramet
     if error:
         raise RuntimeError(error)
 
-    if formato_val == "3":  # CSV
-        df = pd.read_csv(io.BytesIO(contenido), sep=None, engine="python")
-    else:  # Excel Horizontal o Vertical
-        df = pd.read_excel(io.BytesIO(contenido))
+    df = _parsear_contenido_coes(contenido, formato_val)
 
     if df.empty:
         raise RuntimeError("El archivo se descargó pero no contiene filas (posible mezcla de tramos).")
@@ -571,29 +612,7 @@ if submitted:
     tramos = dividir_en_meses(fecha_inicial, fecha_final)
 
     if len(tramos) == 1:
-        # Rango de 1 mes o menos: descarga directa, sin consolidar
-        with st.spinner("Consultando el portal COES..."):
-            contenido, nombre, error = descargar_medidores_generacion(
-                fecha_inicial=fecha_inicial.strftime("%d/%m/%Y"),
-                fecha_final=fecha_final.strftime("%d/%m/%Y"),
-                empresas=empresas_val,
-                tipos_generacion=tipo_gen_val,
-                central=central_val,
-                parametros=parametros_val,
-                tipo=formato_val,
-            )
-
-        if error:
-            st.error(f"No se pudo descargar: {error}")
-        else:
-            st.success(f"Listo — {nombre}")
-            st.download_button(
-                "⬇️ Guardar archivo",
-                data=contenido,
-                file_name=nombre,
-                use_container_width=True,
-            )
-
+        st.info("Consultando el portal COES (1 mes o menos, no requiere partir en tramos)...")
     else:
         st.info(
             f"El rango pedido abarca {len(tramos)} meses. El portal COES solo "
@@ -602,74 +621,80 @@ if submitted:
             f"los tramos que fallen, y luego se consolidará todo en un solo archivo."
         )
 
-        progreso = st.progress(0.0)
-        estado = st.empty()
-        t0 = time.time()
+    progreso = st.progress(0.0)
+    estado = st.empty()
+    t0 = time.time()
 
-        resultados, errores = _procesar_tramos_con_reintentos(
-            tramos, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val,
-            max_workers, max_reintentos, progreso, estado,
-        )
+    # Se usa el mismo flujo sin importar si es 1 tramo o varios: así siempre
+    # se arma un DataFrame consolidado (antes, con 1 solo mes, la app se
+    # limitaba a ofrecer el archivo crudo sin parsear nada).
+    resultados, errores = _procesar_tramos_con_reintentos(
+        tramos, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val,
+        max_workers, max_reintentos, progreso, estado,
+    )
 
-        elapsed = time.time() - t0
-        estado.empty()
-        progreso.empty()
-        st.caption(f"⏱️ Tiempo total: {elapsed:.1f} s ({len(tramos)} tramo(s), {max_workers} en paralelo)")
+    elapsed = time.time() - t0
+    estado.empty()
+    progreso.empty()
+    st.caption(f"⏱️ Tiempo total: {elapsed:.1f} s ({len(tramos)} tramo(s), {max_workers} en paralelo)")
 
-        # Reordenar los DataFrames según el orden cronológico de los tramos
-        dataframes = [resultados[t] for t in tramos if t in resultados]
+    # Reordenar los DataFrames según el orden cronológico de los tramos
+    dataframes = [resultados[t] for t in tramos if t in resultados]
 
-        if errores:
-            with st.expander(f"⚠️ {len(errores)} tramo(s) fallaron tras los reintentos", expanded=True):
-                for rango_str, msg in errores:
-                    st.write(f"- **{rango_str}**: {msg}")
-                st.warning(
-                    "Puedes intentar descargar estos tramos individualmente cambiando "
-                    "el rango de fechas arriba, o volver a presionar 'Descargar' para "
-                    "reintentar todo el proceso."
-                )
-
-        if dataframes:
-            df_final = pd.concat(dataframes, ignore_index=True)
-
-            if len(dataframes) == len(tramos):
-                st.success(
-                    f"✅ Consolidado completo — {len(dataframes)} de {len(tramos)} tramos "
-                    f"({len(df_final):,} filas en total)."
-                )
-            else:
-                st.warning(
-                    f"Consolidado parcial — {len(dataframes)} de {len(tramos)} tramos "
-                    f"({len(df_final):,} filas en total). Revisa los tramos fallidos arriba."
-                )
-
-            st.dataframe(df_final.head(300), use_container_width=True)
-
-            nombre_base = (
-                f"MedidoresGeneracion_{fecha_inicial.strftime('%Y%m%d')}_"
-                f"{fecha_final.strftime('%Y%m%d')}_consolidado"
+    if errores:
+        with st.expander(f"⚠️ {len(errores)} tramo(s) fallaron tras los reintentos", expanded=True):
+            for rango_str, msg in errores:
+                st.write(f"- **{rango_str}**: {msg}")
+            st.warning(
+                "Puedes intentar descargar estos tramos individualmente cambiando "
+                "el rango de fechas arriba, o volver a presionar 'Descargar' para "
+                "reintentar todo el proceso."
             )
 
-            # Descarga xlsx
-            buf_xlsx = io.BytesIO()
-            with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as writer:
-                df_final.to_excel(writer, index=False, sheet_name="MedidoresGeneracion")
-            st.download_button(
-                "⬇️ Descargar Excel consolidado",
-                data=buf_xlsx.getvalue(),
-                file_name=f"{nombre_base}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+    if dataframes:
+        df_final = pd.concat(dataframes, ignore_index=True, sort=False)
 
-            # Descarga csv
-            buf_csv = df_final.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "⬇️ Descargar CSV consolidado",
-                data=buf_csv,
-                file_name=f"{nombre_base}.csv",
-                mime="text/csv",
-                use_container_width=True,
+        if len(dataframes) == len(tramos):
+            st.success(
+                f"✅ Consolidado completo — {len(dataframes)} de {len(tramos)} tramos "
+                f"({len(df_final):,} filas en total)."
             )
         else:
-            st.error("No se pudo descargar ningún tramo.")
+            st.warning(
+                f"Consolidado parcial — {len(dataframes)} de {len(tramos)} tramos "
+                f"({len(df_final):,} filas en total). Revisa los tramos fallidos arriba."
+            )
+
+        with st.expander("👀 Ver columnas detectadas (para verificar que el encabezado se leyó bien)"):
+            st.write(list(df_final.columns))
+
+        st.dataframe(df_final.head(300), use_container_width=True)
+
+        nombre_base = (
+            f"MedidoresGeneracion_{fecha_inicial.strftime('%Y%m%d')}_"
+            f"{fecha_final.strftime('%Y%m%d')}_consolidado"
+        )
+
+        # Descarga xlsx
+        buf_xlsx = io.BytesIO()
+        with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as writer:
+            df_final.to_excel(writer, index=False, sheet_name="MedidoresGeneracion")
+        st.download_button(
+            "⬇️ Descargar Excel consolidado",
+            data=buf_xlsx.getvalue(),
+            file_name=f"{nombre_base}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+        # Descarga csv
+        buf_csv = df_final.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ Descargar CSV consolidado",
+            data=buf_csv,
+            file_name=f"{nombre_base}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    else:
+        st.error("No se pudo descargar ningún tramo.")
