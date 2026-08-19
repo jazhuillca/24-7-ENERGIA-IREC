@@ -247,6 +247,20 @@ if archivos:
         except Exception as e:
             st.error(f"No se pudo leer la hoja '{hoja}' en '{nombre_ref}': {e}")
 
+    with st.expander("👀 Ver columnas detectadas tras el procesamiento (diagnóstico)"):
+        nombre_diag = st.selectbox(
+            "Archivo a inspeccionar", options=list(archivos.keys()), key="diag_select"
+        )
+        try:
+            df_diag = leer_procesado(archivos[nombre_diag], hoja)
+            st.write(f"**{len(df_diag.columns)} columnas detectadas** (primeras 10):")
+            st.write(list(df_diag.columns[:10]))
+            st.write(f"**Primera columna** (debería ser la de Fecha/Hora): `{df_diag.columns[0]}`")
+            st.write(f"**Tipo de dato de la primera columna:** `{df_diag.dtypes.iloc[0]}`")
+            st.dataframe(df_diag.head(5), width='stretch')
+        except Exception as e:
+            st.error(f"No se pudo procesar '{nombre_diag}': {e}")
+
     if st.button("Consolidar todos los archivos disponibles", type="primary"):
         dfs = []
         columnas_vistas = set()
