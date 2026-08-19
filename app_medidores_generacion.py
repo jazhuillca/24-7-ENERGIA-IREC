@@ -90,48 +90,51 @@ def descargar_archivo(year: int, month: int, nombre_archivo: Optional[str] = Non
 
 def filtrar_columnas_soles(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Estructura real de la hoja 'Cmg_Barra': la columna A es Fecha, la
-    columna B es un MARCADOR de bloque cuyo texto literal es "S/./MWh", y
-    de ahí en adelante vienen los nombres de cada barra SIN sufijo de
-    moneda (ej. "AGROLMOS 60", "AGUAYTIA 13.8", ...). Más a la derecha
-    suele repetirse el mismo patrón con un marcador "USD/MWh" para el
-    bloque en dólares.
+    Estructura real de la hoja 'Cmg_Barra': la celda que dice literalmente
+    "S/./MWh" (fila 3) NO es el nombre de una barra ni un simple marcador de
+    bloque -- es el encabezado de la columna A, que contiene los valores de
+    Fecha/Hora. Es una particularidad de la plantilla de COES: usan esa
+    celda como "título" de toda la tabla en vez de escribir "Fecha" ahí.
 
-    Esta función ubica esos dos marcadores por posición (no por nombre de
-    barra) y se queda con: Fecha + todas las columnas de barras que caen
-    ENTRE el marcador de soles y el marcador de dólares (o hasta el final
-    si no hay bloque en dólares). Como no depende de una letra de columna
-    fija, se adapta automáticamente si el número de barras cambia de un
-    mes a otro.
+    A partir de la columna siguiente vienen los nombres de cada barra SIN
+    sufijo de moneda (ej. "AGROLMOS 60", "AGUAYTIA 13.8", ...). Más a la
+    derecha suele repetirse el mismo patrón con un marcador "USD/MWh" para
+    el bloque en dólares.
+
+    Esta función ubica el marcador "S/./MWh" por posición, lo trata como la
+    columna de Fecha (renombrándola a "Fecha" para claridad) y toma todas
+    las columnas de barras que vienen después, hasta el marcador de dólares
+    (o hasta el final si no hay bloque en dólares). Como no depende de una
+    letra de columna fija, se adapta automáticamente si el número de barras
+    cambia de un mes a otro.
     """
     columnas = list(df.columns)
 
     def normalizar(texto):
         return re.sub(r"\s+", "", str(texto)).lower()
 
-    col_fecha = next((c for c in columnas if "fecha" in str(c).lower()), columnas[0])
-
     idx_marcador_soles = next(
         (i for i, c in enumerate(columnas)
          if re.fullmatch(r"s/\.?/?mwh", normalizar(c))),
         None,
     )
+
+    if idx_marcador_soles is None:
+        # No se encontró el marcador "S/./MWh" -> se asume que la primera
+        # columna es la de Fecha, como último recurso.
+        idx_marcador_soles = 0
+
     idx_marcador_usd = next(
         (i for i, c in enumerate(columnas)
          if "usd" in normalizar(c) or "us$" in normalizar(c)),
         None,
     )
 
-    if idx_marcador_soles is None:
-        # No se encontró el marcador "S/./MWh" -> no se puede ubicar el
-        # bloque de forma confiable; se devuelve solo Fecha para que el
-        # error sea visible en vez de arrastrar datos incorrectos.
-        return df[[col_fecha]]
+    col_fecha = columnas[idx_marcador_soles]
+    inicio_barras = idx_marcador_soles + 1
+    fin_barras = idx_marcador_usd if idx_marcador_usd is not None else len(columnas)
 
-    inicio = idx_marcador_soles  # incluye la propia columna "S/./MWh"
-    fin = idx_marcador_usd if idx_marcador_usd is not None else len(columnas)
-
-    columnas_barras = columnas[inicio:fin]
+    columnas_barras = columnas[inicio_barras:fin_barras]
     return df[[col_fecha] + columnas_barras]
 
 
@@ -153,8 +156,12 @@ def leer_procesado(contenido: bytes, hoja: str) -> pd.DataFrame:
     # trae texto residual (por ejemplo restos de un encabezado repetido o una
     # nota al pie), la columna queda con tipos mezclados (texto + número) y
     # Streamlit/PyArrow falla al serializarla para mostrarla o exportarla.
-    for col in df.columns:
-        if "fecha" in str(col).lower():
+    #
+    # La primera columna es la de Fecha/Hora por POSICIÓN (aunque su nombre
+    # literal sea "S/./MWh", no se renombra por pedido explícito), así que
+    # se identifica por posición en vez de buscar "fecha" en el nombre.
+    for i, col in enumerate(df.columns):
+        if i == 0:
             df[col] = pd.to_datetime(df[col], errors="coerce")
         else:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -244,10 +251,14 @@ if archivos:
         dfs = []
         columnas_vistas = set()
         columnas_por_mes = {}
+        col_fecha_nombre = None
 
         for nombre, contenido in archivos.items():
             try:
                 df = leer_procesado(contenido, hoja)
+
+                if col_fecha_nombre is None:
+                    col_fecha_nombre = df.columns[0]  # primera columna = Fecha/Hora
 
                 nuevas = [c for c in df.columns if c not in columnas_vistas]
                 if columnas_vistas and nuevas:
@@ -270,10 +281,10 @@ if archivos:
             # Avisa si alguna barra del set total no aparece en TODOS los meses
             # (útil para detectar barras que se dieron de baja o entraron a
             # mitad de camino).
-            todas_las_barras = columnas_vistas - {"Archivo_Origen"}
+            todas_las_barras = columnas_vistas - {"Archivo_Origen", col_fecha_nombre}
             for barra in sorted(todas_las_barras):
                 meses_con_barra = [m for m, cols in columnas_por_mes.items() if barra in cols]
-                if len(meses_con_barra) < len(columnas_por_mes) and "fecha" not in str(barra).lower():
+                if len(meses_con_barra) < len(columnas_por_mes):
                     meses_sin_barra = [m for m in columnas_por_mes if m not in meses_con_barra]
                     st.caption(f"⚠️ '{barra}' no aparece en: {', '.join(meses_sin_barra)} (quedará NaN ahí).")
 
