@@ -503,7 +503,17 @@ def _parsear_vertical_coes(contenido: bytes) -> tuple[pd.DataFrame, pd.DataFrame
     tabla = datos.iloc[:, col_indices].copy()
     tabla.columns = pd.MultiIndex.from_tuples(columnas, names=["Empresa", "Central", "Unidad"])
     if col_total is not None:
-        tabla[("(TOTAL)", "(TOTAL)", "(TOTAL)")] = datos.iloc[:, col_total]
+        valores_total = datos.iloc[:, col_total]
+        # En la práctica COES nunca llena esta columna con datos reales de
+        # intervalos -- los únicos valores no nulos que trae vienen de las
+        # filas de resumen al pie ("TOTAL ENERGÍA", etc.), que se descartan
+        # más abajo por no tener una fecha válida. Por eso se evalúa si tiene
+        # datos reales SOLO entre las filas con Fecha/Hora válida (si se
+        # revisara antes de filtrar, esas filas de resumen harían pensar que
+        # sí tiene datos, cuando en realidad no aporta nada para los
+        # intervalos de 15 minutos).
+        if valores_total[fecha_hora.notna()].notna().any():
+            tabla[("(TOTAL)", "(TOTAL)", "(TOTAL)")] = valores_total
 
     # Agrupar las unidades de cada central, para sumarlas en una sola
     # columna (el encabezado final solo muestra Empresa, Central -- ya no
