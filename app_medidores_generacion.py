@@ -190,12 +190,34 @@ if enviado:
             # content_type_o_error contiene el mensaje de error (caso JSON inesperado)
             st.warning(content_type_o_error)
         elif contenido is not None:
-            st.success(f"Archivo listo: {nombre_archivo}")
-            st.download_button(
-                label="⬇️ Guardar archivo",
-                data=io.BytesIO(contenido),
-                file_name=nombre_archivo,
-                mime=content_type_o_error or "application/octet-stream",
-            )
+            # Un .xlsx real es un ZIP por dentro: siempre empieza con esta firma.
+            es_zip_valido = contenido[:4] == b"PK\x03\x04"
+
+            if not es_zip_valido:
+                st.error(
+                    "El servidor no devolvió un archivo Excel válido "
+                    f"(Content-Type: {content_type_o_error!r}, "
+                    f"{len(contenido)} bytes). Esto suele pasar cuando la sesión "
+                    "expiró, el payload es inválido, o el COES devolvió una "
+                    "página de error en vez del reporte. Contenido recibido "
+                    "(puede ser HTML o texto de error):"
+                )
+                # Mostramos el contenido crudo (decodificado si es posible) para diagnosticar
+                try:
+                    texto = contenido.decode("utf-8", errors="replace")
+                except Exception:
+                    texto = repr(contenido[:500])
+                st.code(texto[:2000])
+            else:
+                st.success(f"Archivo listo: {nombre_archivo}")
+                st.download_button(
+                    label="⬇️ Guardar archivo",
+                    data=io.BytesIO(contenido),
+                    file_name=nombre_archivo,
+                    mime=(
+                        content_type_o_error
+                        or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    ),
+                )
         else:
             st.error("No se pudo obtener el archivo por un motivo desconocido.")
