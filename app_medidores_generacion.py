@@ -20,6 +20,7 @@ Ejecutar con:
 """
 
 import io
+import re
 from datetime import date, timedelta
 
 import requests
@@ -32,18 +33,143 @@ BASE_URL = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/"
 URL_EXPORTAR = BASE_URL + "Exportar"
 REFERER = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion"
 
-DEFAULT_EMPRESAS = (
-    "14260,69,15214,11772,12439,11777,10481,12056,12362,13196,12896,10628,15707,"
-    "10420,12708,13165,10901,15571,12584,11095,17,11153,58,19,10684,30,27,40,"
-    "11228,23,24,2,11389,14173,11412,206,11544,11058,12097,10552,11429,12884,"
-    "15624,15392,10725,11527,10647,14973,11981,11840,11841,12974,10974,11258,"
-    "11644,11444,11940,12364,11149,11528,12634,15849,12624,13726,12479,14807,"
-    "11185,13,10916,13965,67,108,11217,12480,15259,11102,13120,11218,11063,149,"
-    "11323,13966,15009,61,10913,10587,8,138,12758,11103,15080,10,15683,14342,"
-    "13984,167,10422,180,11146,15014,4,5,9,76,11563,10636,11129,11509,12096,"
-    "11395,13783,18,48,10582,11064,47,11100,10755,12190,11053,10984,11101,11486,"
-    "6,11567,10767,11894"
-)
+# Lista real de empresas, extraída directamente del <select id="cbEmpresas">
+# de la página (confirmado por inspección en DevTools). Se usa como valor
+# por defecto para no depender de la llamada AJAX en vivo, aunque igual
+# puedes refrescarla con el botón "Cargar lista de empresas".
+EMPRESAS_CONOCIDAS = [
+    ("14260", "ACCIONA ENERGIA PERU S.A.C"),
+    ("69", "ADINELSA ADN"),
+    ("15214", "AGRO INDUSTRIAL PARAMONGA S.A."),
+    ("11772", "AGROAURORA S.A.C."),
+    ("12439", "AGROINDUSTRIAS SAN JACINTO S.A.A."),
+    ("11777", "AGROLMOS SOCIEDAD ANONIMA - AGROLMOS S.A."),
+    ("10481", "AGUAS Y ENERGIA PERU"),
+    ("12056", "ANDEAN POWER S.A.C."),
+    ("12362", "ASOCIACIÓN SANTA LUCIA DE CHACAS"),
+    ("13196", "ATRIA ENERGIA S.A.C."),
+    ("12896", "BIOENERGIA DEL CHIRA S.A."),
+    ("10628", "CASA GRANDE S.A.A."),
+    ("15707", "CELARIS ENERGY S.A."),
+    ("10420", "CELEPSA"),
+    ("12708", "CELEPSA RENOVABLES S.R.L."),
+    ("13165", "CENTRALES SANTA ROSA S.A.C."),
+    ("10901", "CHINANGO S.A.C."),
+    ("15571", "COENERGY S.A.C."),
+    ("12584", "COLCA SOLAR S.A.C."),
+    ("11480", "COMPAÑIA MINERA ANTAPACCAY S.A."),
+    ("11095", "CORPORACION MINERA DEL PERU S.A."),
+    ("17", "EGASA"),
+    ("11153", "EGEJUNIN"),
+    ("58", "EGEMSA"),
+    ("19", "EGESUR"),
+    ("10684", "ELECTRICA YANAPAMPA SAC"),
+    ("30", "ELECTRO ORIENTE"),
+    ("27", "ELECTRO SUR ESTE"),
+    ("40", "ELECTRO UCAYALI"),
+    ("11228", "ELECTRO ZAÑA S.A.C."),
+    ("23", "ELECTRONOROESTE S.A."),
+    ("24", "ELECTRONORTE S.A."),
+    ("2", "ELECTROPERU"),
+    ("11389", "EMPRESA DE GENERACION ELECTRICA CANCHAYLLO SAC"),
+    ("14173", "EMPRESA DE GENERACION ELECTRICA SANTA ANA S.A.C."),
+    ("11412", "EMPRESA DE GENERACION HUALLAGA"),
+    ("206", "EMPRESA DE GENERACION HUANZA"),
+    ("11544", "EMPRESA ELECTRICA AGUA AZUL"),
+    ("11058", "EMPRESA ELECTRICA RIO DOBLE"),
+    ("12097", "ENEL GENERACION PIURA S.A."),
+    ("10552", "ENERGÍA EÓLICA S.A."),
+    ("11429", "ENERGIA RENOVABLE DEL SUR S.A."),
+    ("12884", "ENERGIA RENOVABLE LA JOYA S.A."),
+    ("15624", "ENGIE ENERGIA PERU S.A.A."),
+    ("15392", "EOLICA CARAVELI S.A.C."),
+    ("10725", "FENIX POWER PERÚ"),
+    ("11527", "GENERACIÓN ANDINA S.A.C."),
+    ("10647", "GENERADORA DE ENERGÍA DEL PERÚ"),
+    ("14973", "GM OPERACIONES S.A.C."),
+    ("11981", "GR CORTARRAMA SOCIEDAD ANONIMA CERRADA"),
+    ("11840", "GR PAINO SOCIEDAD ANONIMA CERRADA"),
+    ("11841", "GR TARUCA SOCIEDAD ANONIMA CERRADA"),
+    ("12974", "GR VALE S.A.C."),
+    ("10974", "HIDROCAÑETE S.A."),
+    ("11258", "HIDROELECTRICA HUANCHOR S.A.C."),
+    ("11644", "HIDROELECTRICA RAPAZ S.A.C."),
+    ("11444", "HUAURA POWER GROUP S.A."),
+    ("11940", "HYDRO GLOBAL PERÚ S.A.C."),
+    ("12364", "HYDRO PATAPO S.A.C."),
+    ("11149", "ILLAPU ENERGY"),
+    ("11528", "INFRAESTRUCTURAS Y ENERGIAS DEL PERU S.A.C."),
+    ("12634", "INLAND ENERGY SAC"),
+    ("15849", "INTI JOYA S.A.C."),
+    ("12624", "INVERSIONES SHAQSHA S.A.C."),
+    ("13726", "JOYA SOLAR S.A.C."),
+    ("12479", "KALLPA GENERACION S.A."),
+    ("14807", "KONDU SAC"),
+    ("11185", "LA VIRGEN"),
+    ("13", "LUZ DEL SUR"),
+    ("10916", "MAJA ENERGIA S.A.C."),
+    ("13965", "MAJES ARCUS S.A.C."),
+    ("67", "MINERA CERRO VERDE"),
+    ("108", "MINERA CORONA"),
+    ("11217", "MOQUEGUA FV S.A.C."),
+    ("12480", "ORAZUL ENERGY PERÚ"),
+    ("15259", "ORYGEN PERU S.A.A."),
+    ("11102", "PANAMERICANA SOLAR SAC."),
+    ("13120", "PARQUE EOLICO MARCONA S.A.C."),
+    ("11218", "PARQUE EOLICO TRES HERMANAS S.A.C."),
+    ("11063", "PETRAMAS"),
+    ("149", "PETROPERU"),
+    ("11323", "PLANTA DE RESERVA FRIA DE GENERACION DE ETEN S.A."),
+    ("10784", "REFINERIA LA PAMPILLA S.A.A"),
+    ("13966", "REPARTICIÓN ARCUS S.A.C."),
+    ("15009", "SAMAY I S.A.C"),
+    ("61", "SAN GABAN"),
+    ("10913", "SDE PIURA"),
+    ("10587", "SDF ENERGIA SAC"),
+    ("8", "SHOUGESA"),
+    ("138", "SINERSA"),
+    ("12758", "STATKRAFT S.A"),
+    ("11103", "TACNA SOLAR SAC."),
+    ("15080", "TERMOCHILCA S.A.C."),
+    ("10", "TERMOSELVA"),
+    ("15683", "TRANSMISION ANDINA DE GENERACION S.A.C."),
+    ("11410", "TRUPAL S.A."),
+    ("14342", "UNACEM PERU S.A."),
+    ("13984", "VARI ENERGIA S.A.C."),
+    ("167", "YURA"),
+    ("10422", "AGRO INDUSTRIAL PARAMONGA"),
+    ("180", "CEMENTO ANDINO"),
+    ("11146", "CERRO DEL AGUILA S.A."),
+    ("15014", "COGENERACION OQUENDO SAC"),
+    ("4", "EDEGEL"),
+    ("5", "EEPSA"),
+    ("9", "EGENOR"),
+    ("76", "ELECTRICA SANTA ROSA"),
+    ("11563", "EMPRESA CONCESIONARIA ENERGIA LIMPIA SAC"),
+    ("10636", "EMPRESA DE GENERACIÓN ELÉCTRICA CHEVES S.A."),
+    ("11129", "EMPRESA DE GENERACION ELECTRICA RIO BAÑOS S.A.C."),
+    ("11509", "EMPRESA DE GENERACION ELECTRICA SANTA ANA"),
+    ("12096", "ENEL GENERACION PERU S.A.A."),
+    ("11395", "ENEL GREEN POWER PERU S.A."),
+    ("13783", "ENEL GREEN POWER PERU S.A.C"),
+    ("18", "ENERSUR"),
+    ("48", "ENGIE"),
+    ("10582", "HIDROELECTRICA SANTA CRUZ"),
+    ("11064", "HIDROMARAÑON"),
+    ("47", "KALLPA GENERACION"),
+    ("11100", "MAJES ARCUS"),
+    ("10755", "MAPLE ETANOL"),
+    ("12190", "ORAZUL ENERGY"),
+    ("11053", "PARQUE EOLICO MARCONA S.R.L."),
+    ("10984", "PERUANA DE INVERSIONES EN ENERGIAS RENOVABLES S.A."),
+    ("11101", "REPARTICIÓN ARCUS"),
+    ("11486", "SAMAY I S.A."),
+    ("6", "SN POWER"),
+    ("11567", "STATKRAFT"),
+    ("10767", "TERMOCHILCA"),
+    ("11894", "UNION ANDINA DE CEMENTO"),
+]
+
 DEFAULT_TIPOS_GENERACION = "4,1,3,2"  # EÓLICA, HIDROELÉCTRICA, SOLAR, TERMOELÉCTRICA
 
 # Parámetros reales vistos en el <select id="cbParametroExportar"> del modal
@@ -82,6 +208,38 @@ def _session() -> requests.Session:
     # Visitamos la página primero para obtener cualquier cookie de sesión necesaria
     s.get(REFERER, timeout=30)
     return s
+
+
+def obtener_empresas(tipos_empresa: str = ""):
+    """
+    Replica cargarEmpresas(): POST a .../empresas, que devuelve el HTML
+    (checkboxes u <option>) con la lista real de empresas disponibles.
+
+    Devuelve una lista de tuplas (id, nombre) parseadas del HTML, y también
+    el HTML crudo por si el parseo no encuentra el patrón esperado.
+    """
+    s = _session()
+    resp = s.post(
+        BASE_URL + "empresas",
+        data={"tiposEmpresa": tipos_empresa},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    html = resp.text
+
+    # Intentamos varios patrones comunes: <option value="X">Nombre</option>
+    # y checkboxes tipo <input ... value="X" ... > ... <label ...>Nombre</label>
+    empresas = re.findall(r'<option[^>]*value=["\']?(\d+)["\']?[^>]*>([^<]+)</option>', html)
+
+    if not empresas:
+        # Fallback: pares value=".." seguidos de un texto de label cercano
+        empresas = re.findall(
+            r'value=["\']?(\d+)["\']?[^>]*>\s*(?:<[^>]*>)*\s*([^<>{}\n]{2,80})',
+            html,
+        )
+
+    empresas = [(id_, nombre.strip()) for id_, nombre in empresas if nombre.strip()]
+    return empresas, html
 
 
 def descargar_medidores_generacion(
@@ -153,6 +311,34 @@ st.info(
     icon="ℹ️",
 )
 
+col_carga1, col_carga2 = st.columns([1, 3])
+with col_carga1:
+    cargar = st.button("🔄 Refrescar lista de empresas")
+with col_carga2:
+    n_empresas = len(st.session_state.get("empresas_disponibles", EMPRESAS_CONOCIDAS))
+    st.caption(f"{n_empresas} empresas disponibles (lista precargada; puedes refrescarla).")
+
+if "empresas_disponibles" not in st.session_state:
+    st.session_state["empresas_disponibles"] = EMPRESAS_CONOCIDAS
+
+if cargar:
+    with st.spinner("Consultando lista de empresas en el COES..."):
+        try:
+            empresas_lista, html_crudo = obtener_empresas()
+            if empresas_lista:
+                st.session_state["empresas_disponibles"] = empresas_lista
+                st.success(f"Se actualizaron {len(empresas_lista)} empresas.")
+            else:
+                st.warning(
+                    "No se pudo interpretar la lista de empresas devuelta por el "
+                    "COES; se mantiene la lista precargada. Revisa el HTML crudo "
+                    "abajo si quieres ajustar el parseo."
+                )
+                with st.expander("Ver HTML crudo de la respuesta"):
+                    st.code(html_crudo[:3000])
+        except requests.exceptions.RequestException as exc:
+            st.error(f"Error al refrescar empresas: {exc}. Se mantiene la lista precargada.")
+
 with st.form("form_descarga"):
     col1, col2 = st.columns(2)
     hoy = date.today()
@@ -172,24 +358,19 @@ with st.form("form_descarga"):
     formato_label = st.selectbox("Formato de salida", list(FORMATOS.keys()))
 
     with st.expander("Parámetros avanzados"):
-        empresas = st.text_area(
-            "Empresas (IDs separados por coma)",
-            value=DEFAULT_EMPRESAS,
-            height=100,
+        empresas_cargadas = st.session_state["empresas_disponibles"]
+        empresas_sel = st.multiselect(
+            "Empresas",
+            options=[nombre for _id, nombre in empresas_cargadas],
+            default=[],
+            help="Vacío = todas las empresas (igual que el comportamiento del formulario original).",
         )
+        nombre_a_id = {nombre: id_ for id_, nombre in empresas_cargadas}
+        empresas = ",".join(nombre_a_id[n] for n in empresas_sel)
+
         tipos_generacion = st.text_input(
             "Tipos de generación (IDs separados por coma)",
             value=DEFAULT_TIPOS_GENERACION,
-        )
-        tipos_empresa = st.text_input(
-            "Tipos de empresa (IDs separados por coma, puede dejarse vacío)",
-            value="",
-            help=(
-                "El JS del COES también envía un campo 'tiposEmpresa' que proviene "
-                "de un multiselect (#cbTipoEmpresa) que no vimos con sus opciones "
-                "reales. Si tu exportación falla, revisa este filtro en la página "
-                "y copia los valores que use."
-            ),
         )
         central_label = st.selectbox(
             "Central", list(CENTRAL_OPCIONES.keys()), index=1  # COES por defecto
@@ -228,7 +409,6 @@ if enviado:
                     fecha_final=ff_str,
                     empresas=empresas,
                     tipos_generacion=tipos_generacion,
-                    tipos_empresa=tipos_empresa,
                     central=CENTRAL_OPCIONES[central_label],
                     parametros=parametros_str,
                     tipo=FORMATOS[formato_label],
