@@ -1,9 +1,10 @@
+racion · PY
 """
 Streamlit app: Descarga el reporte de Medidores de Generación del COES.
-
+ 
 Página:   https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion
 JS real:  /Portal/Areas/Mediciones/Content/Scripts/medidores.js (función exportarFormato)
-
+ 
 Hallazgos clave del JS (confirmados leyendo el código fuente real):
 - La exportación es un GET (no POST) a:
       /Portal/mediciones/medidoresgeneracion/Exportar?<query string>
@@ -14,25 +15,25 @@ Hallazgos clave del JS (confirmados leyendo el código fuente real):
     * El rango [fechaInicial, fechaFinal] no puede superar 31 días.
     * Si tipo == '3' (CSV), solo se permite seleccionar 1 parámetro.
     * Debe haber al menos 1 parámetro seleccionado.
-
+ 
 Ejecutar con:
     streamlit run app_medidores_generacion.py
 """
-
+ 
 import io
 import re
 from datetime import date, timedelta
-
+ 
 import requests
 import streamlit as st
-
+ 
 # ---------------------------------------------------------------------------
 # Configuración fija
 # ---------------------------------------------------------------------------
 BASE_URL = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/"
 URL_EXPORTAR = BASE_URL + "Exportar"
 REFERER = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion"
-
+ 
 # Lista real de empresas, extraída directamente del <select id="cbEmpresas">
 # de la página (confirmado por inspección en DevTools). Se usa como valor
 # por defecto para no depender de la llamada AJAX en vivo, aunque igual
@@ -169,9 +170,9 @@ EMPRESAS_CONOCIDAS = [
     ("10767", "TERMOCHILCA"),
     ("11894", "UNION ANDINA DE CEMENTO"),
 ]
-
+ 
 DEFAULT_TIPOS_GENERACION = "4,1,3,2"  # EÓLICA, HIDROELÉCTRICA, SOLAR, TERMOELÉCTRICA
-
+ 
 # Parámetros reales vistos en el <select id="cbParametroExportar"> del modal
 PARAMETROS_DISPONIBLES = {
     "Potencia Activa (MW)": "1",
@@ -180,20 +181,20 @@ PARAMETROS_DISPONIBLES = {
     "Potencia Reactiva Capacitiva (MVAR)": "2",
     "Potencia Reactiva Inductiva (MVAR)": "4",
 }
-
+ 
 # Valores del <select id="cbCentral">
 CENTRAL_OPCIONES = {"TODOS": "0", "COES": "1", "GENERACION RER": "3"}
-
+ 
 # Valores de los radio buttons rbFormato
 FORMATOS = {
     "Excel Horizontal": "1",
     "Excel Vertical": "2",
     "CSV": "3",
 }
-
+ 
 MAX_DIAS_RANGO = 31  # límite real que impone el JS del COES
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Lógica de descarga (replicando exportarFormato del JS real)
 # ---------------------------------------------------------------------------
@@ -208,13 +209,13 @@ def _session() -> requests.Session:
     # Visitamos la página primero para obtener cualquier cookie de sesión necesaria
     s.get(REFERER, timeout=30)
     return s
-
-
+ 
+ 
 def obtener_empresas(tipos_empresa: str = ""):
     """
     Replica cargarEmpresas(): POST a .../empresas, que devuelve el HTML
     (checkboxes u <option>) con la lista real de empresas disponibles.
-
+ 
     Devuelve una lista de tuplas (id, nombre) parseadas del HTML, y también
     el HTML crudo por si el parseo no encuentra el patrón esperado.
     """
@@ -226,22 +227,22 @@ def obtener_empresas(tipos_empresa: str = ""):
     )
     resp.raise_for_status()
     html = resp.text
-
+ 
     # Intentamos varios patrones comunes: <option value="X">Nombre</option>
     # y checkboxes tipo <input ... value="X" ... > ... <label ...>Nombre</label>
     empresas = re.findall(r'<option[^>]*value=["\']?(\d+)["\']?[^>]*>([^<]+)</option>', html)
-
+ 
     if not empresas:
         # Fallback: pares value=".." seguidos de un texto de label cercano
         empresas = re.findall(
             r'value=["\']?(\d+)["\']?[^>]*>\s*(?:<[^>]*>)*\s*([^<>{}\n]{2,80})',
             html,
         )
-
+ 
     empresas = [(id_, nombre.strip()) for id_, nombre in empresas if nombre.strip()]
     return empresas, html
-
-
+ 
+ 
 def descargar_medidores_generacion(
     fecha_inicial: str,
     fecha_final: str,
@@ -256,12 +257,12 @@ def descargar_medidores_generacion(
     fecha_inicial / fecha_final: strings en formato dd/mm/yyyy.
     parametros: string con los códigos separados por coma, ej. "1,5,3".
     tipo: "1" (Excel Horizontal), "2" (Excel Vertical) o "3" (CSV).
-
+ 
     Devuelve (contenido_bytes, content_type, nombre_archivo_sugerido) si tuvo éxito,
     o (None, mensaje_error, None) si falló.
     """
     s = _session()
-
+ 
     # El JS arma esto como querystring con $.param() y hace un GET (window.open)
     params = {
         "fechaInicial": fecha_inicial,
@@ -273,10 +274,10 @@ def descargar_medidores_generacion(
         "parametros": parametros,
         "tipo": tipo,
     }
-
+ 
     resp = s.get(URL_EXPORTAR, params=params, timeout=180)
     resp.raise_for_status()
-
+ 
     content_type = resp.headers.get("Content-Type", "")
     if "text/html" in content_type or "json" in content_type:
         mensaje = (
@@ -284,43 +285,43 @@ def descargar_medidores_generacion(
             f"{resp.text[:800]}"
         )
         return None, mensaje, None
-
+ 
     disposition = resp.headers.get("Content-Disposition", "")
     nombre_archivo = "medidores_generacion.xlsx"
     if "filename=" in disposition:
         nombre_archivo = disposition.split("filename=")[-1].strip('"; ')
-
+ 
     return resp.content, content_type, nombre_archivo
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # UI de Streamlit
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="COES · Medidores de Generación", page_icon="⚡")
-
+ 
 st.title("⚡ Medidores de Generación — COES")
 st.caption(
     "Descarga el reporte de Medidores de Generación desde el portal del COES "
     "(www.coes.org.pe)."
 )
-
+ 
 st.info(
     f"El propio formulario del COES limita cada exportación a un rango máximo "
     f"de **{MAX_DIAS_RANGO} días**, y si eliges formato **CSV** solo puedes "
     f"seleccionar **un** parámetro a la vez.",
     icon="ℹ️",
 )
-
+ 
 col_carga1, col_carga2 = st.columns([1, 3])
 with col_carga1:
     cargar = st.button("🔄 Refrescar lista de empresas")
 with col_carga2:
     n_empresas = len(st.session_state.get("empresas_disponibles", EMPRESAS_CONOCIDAS))
     st.caption(f"{n_empresas} empresas disponibles (lista precargada; puedes refrescarla).")
-
+ 
 if "empresas_disponibles" not in st.session_state:
     st.session_state["empresas_disponibles"] = EMPRESAS_CONOCIDAS
-
+ 
 if cargar:
     with st.spinner("Consultando lista de empresas en el COES..."):
         try:
@@ -338,7 +339,7 @@ if cargar:
                     st.code(html_crudo[:3000])
         except requests.exceptions.RequestException as exc:
             st.error(f"Error al refrescar empresas: {exc}. Se mantiene la lista precargada.")
-
+ 
 with st.form("form_descarga"):
     col1, col2 = st.columns(2)
     hoy = date.today()
@@ -348,15 +349,15 @@ with st.form("form_descarga"):
         )
     with col2:
         fecha_final = st.date_input("Fecha final", value=hoy)
-
+ 
     parametros_sel = st.multiselect(
         "Parámetro(s) a exportar",
         options=list(PARAMETROS_DISPONIBLES.keys()),
         default=["Potencia Activa (MW)"],
     )
-
+ 
     formato_label = st.selectbox("Formato de salida", list(FORMATOS.keys()))
-
+ 
     with st.expander("Parámetros avanzados"):
         empresas_cargadas = st.session_state["empresas_disponibles"]
         empresas_sel = st.multiselect(
@@ -367,7 +368,7 @@ with st.form("form_descarga"):
         )
         nombre_a_id = {nombre: id_ for id_, nombre in empresas_cargadas}
         empresas = ",".join(nombre_a_id[n] for n in empresas_sel)
-
+ 
         tipos_generacion = st.text_input(
             "Tipos de generación (IDs separados por coma)",
             value=DEFAULT_TIPOS_GENERACION,
@@ -375,12 +376,12 @@ with st.form("form_descarga"):
         central_label = st.selectbox(
             "Central", list(CENTRAL_OPCIONES.keys()), index=1  # COES por defecto
         )
-
+ 
     enviado = st.form_submit_button("Descargar reporte")
-
+ 
 if enviado:
     dias = (fecha_final - fecha_inicial).days
-
+ 
     if fecha_inicial > fecha_final:
         st.error("La fecha inicial no puede ser posterior a la fecha final.")
     elif dias > MAX_DIAS_RANGO:
@@ -396,12 +397,12 @@ if enviado:
         fi_str = fecha_inicial.strftime("%d/%m/%Y")
         ff_str = fecha_final.strftime("%d/%m/%Y")
         parametros_str = ",".join(PARAMETROS_DISPONIBLES[p] for p in parametros_sel)
-
+ 
         contenido = None
         content_type_o_error = None
         nombre_archivo = None
         error_conexion = None
-
+ 
         with st.spinner(f"Descargando medidores de generación {fi_str} – {ff_str} ..."):
             try:
                 contenido, content_type_o_error, nombre_archivo = descargar_medidores_generacion(
@@ -420,7 +421,7 @@ if enviado:
                 )
             except requests.exceptions.RequestException as exc:
                 error_conexion = f"Error de conexión con el portal del COES: {exc}"
-
+ 
         if error_conexion:
             st.error(error_conexion)
         elif contenido is None and content_type_o_error is not None:
@@ -428,7 +429,7 @@ if enviado:
         elif contenido is not None:
             # Un .xlsx real es un ZIP por dentro: siempre empieza con esta firma.
             es_zip_valido = contenido[:4] == b"PK\x03\x04"
-
+ 
             if FORMATOS[formato_label] != "3" and not es_zip_valido:
                 st.error(
                     "El servidor no devolvió un archivo Excel válido "
