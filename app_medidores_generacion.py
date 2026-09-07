@@ -1,4 +1,4 @@
- -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 Streamlit — Descarga de "Medidores de Generación" (COES)
 
@@ -410,5 +410,6 @@ if submitted:
             file_name=nombre,
             use_container_width=True,
         )
+
 
 
