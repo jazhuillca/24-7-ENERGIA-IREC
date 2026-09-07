@@ -273,8 +273,10 @@ def descargar_medidores_generacion(
     parametros: string con los códigos separados por coma, ej. "1,5,3".
     tipo: "1" (Excel Horizontal), "2" (Excel Vertical) o "3" (CSV).
 
-    Devuelve (contenido_bytes, content_type, nombre_archivo_sugerido) si tuvo éxito,
-    o (None, mensaje_error, None) si falló.
+    Devuelve (contenido_bytes, content_type, nombre_archivo_sugerido, url_real)
+    si tuvo éxito, o (None, mensaje_error, None, url_real) si falló.
+    `url_real` es la URL exacta que se pidió al COES (incluyendo query string),
+    útil para depurar si el parámetro `tipo` realmente llegó como se esperaba.
     """
     s = _session()
 
@@ -291,6 +293,7 @@ def descargar_medidores_generacion(
     }
 
     resp = s.get(URL_EXPORTAR, params=params, timeout=180)
+    url_real = resp.request.url
     resp.raise_for_status()
 
     content_type = resp.headers.get("Content-Type", "")
@@ -299,14 +302,14 @@ def descargar_medidores_generacion(
             f"Respuesta inesperada (Content-Type: {content_type!r}):\n\n"
             f"{resp.text[:800]}"
         )
-        return None, mensaje, None
+        return None, mensaje, None, url_real
 
     disposition = resp.headers.get("Content-Disposition", "")
     nombre_archivo = "medidores_generacion.xlsx"
     if "filename=" in disposition:
         nombre_archivo = disposition.split("filename=")[-1].strip('"; ')
 
-    return resp.content, content_type, nombre_archivo
+    return resp.content, content_type, nombre_archivo, url_real
 
 
 def _normalizar_texto(valor) -> str:
@@ -548,7 +551,7 @@ if enviado:
             estado.text(f"Descargando y leyendo tramo {i}/{len(tramos)}: {fi_str} – {ff_str} ...")
 
             try:
-                contenido, content_type_o_error, _nombre = descargar_medidores_generacion(
+                contenido, content_type_o_error, _nombre, url_real = descargar_medidores_generacion(
                     fecha_inicial=fi_str,
                     fecha_final=ff_str,
                     empresas=empresas,
@@ -558,21 +561,24 @@ if enviado:
                     tipo=tipo_val,
                 )
             except requests.exceptions.Timeout:
-                errores.append((f"{fi_str}–{ff_str}", "Timeout esperando respuesta del COES."))
+                errores.append((f"{fi_str}–{ff_str}", "Timeout esperando respuesta del COES.", None))
                 progreso.progress(i / len(tramos))
                 continue
             except requests.exceptions.RequestException as exc:
-                errores.append((f"{fi_str}–{ff_str}", f"Error de conexión: {exc}"))
+                errores.append((f"{fi_str}–{ff_str}", f"Error de conexión: {exc}", None))
                 progreso.progress(i / len(tramos))
                 continue
 
+            if i == 1:
+                st.session_state["ultima_url_pedida"] = url_real
+
             if contenido is None:
-                errores.append((f"{fi_str}–{ff_str}", content_type_o_error or "Respuesta vacía."))
+                errores.append((f"{fi_str}–{ff_str}", content_type_o_error or "Respuesta vacía.", url_real))
             else:
                 es_zip_valido = contenido[:4] == b"PK\x03\x04"
                 if tipo_val != "3" and not es_zip_valido:
                     errores.append(
-                        (f"{fi_str}–{ff_str}", "El servidor no devolvió un Excel válido.")
+                        (f"{fi_str}–{ff_str}", "El servidor no devolvió un Excel válido.", url_real)
                     )
                 else:
                     try:
@@ -582,7 +588,7 @@ if enviado:
                         dataframes.append(df_tramo)
                     except Exception as exc:
                         errores.append(
-                            (f"{fi_str}–{ff_str}", f"No se pudo leer como tabla: {exc}")
+                            (f"{fi_str}–{ff_str}", f"No se pudo leer como tabla: {exc}", url_real)
                         )
 
             progreso.progress(i / len(tramos))
@@ -590,11 +596,21 @@ if enviado:
         estado.empty()
         progreso.empty()
 
+        if "ultima_url_pedida" in st.session_state:
+            with st.expander("🔧 URL exacta pedida al COES (para depurar)"):
+                st.code(st.session_state["ultima_url_pedida"])
+                if "tipo=2" in st.session_state["ultima_url_pedida"]:
+                    st.caption("✅ El parámetro tipo=2 (Vertical) sí está en la URL.")
+                elif "tipo=1" in st.session_state["ultima_url_pedida"]:
+                    st.caption("⚠️ La URL pidió tipo=1 (Horizontal), no tipo=2. Revisa el desplegable de formato.")
+
         if errores:
             with st.expander(f"⚠️ {len(errores)} tramo(s) fallaron", expanded=not dataframes):
-                for rango, msg in errores:
+                for rango, msg, url_err in errores:
                     st.markdown(f"**{rango}**")
                     st.code(msg)
+                    if url_err:
+                        st.caption(f"URL pedida: {url_err}")
 
         if dataframes:
             df_final = pd.concat(dataframes, ignore_index=True)
@@ -628,5 +644,4 @@ if enviado:
                 )
         else:
             st.error("No se pudo descargar ni leer ningún tramo. Revisa los errores arriba.")
-
 
