@@ -369,24 +369,29 @@ def _normalizar_empresa(nombre):
     return NORMALIZACION_EMPRESA.get(clave, nombre)
 
 
-def _parsear_vertical_coes(contenido: bytes) -> pd.DataFrame:
+def _parsear_vertical_coes(contenido: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Parser específico para el formato 'Excel Vertical' de COES.
 
     Este formato trae un encabezado JERÁRQUICO de 4 filas (código de medidor,
     empresa, central, unidad de generación) y una fila por cada intervalo de
     15 minutos, con una columna por cada unidad de generación.
 
-    Esta función reproduce esa misma estructura ANCHA: filas = Fecha/Hora,
-    columnas = una por cada unidad de generación, con un encabezado de 3
-    niveles (Empresa, Central, Unidad) -- igual que en COES, las centrales y
-    la empresa quedan en el encabezado, no como valores repetidos en una
-    columna.
+    Esta función reproduce esa estructura ANCHA (filas = Fecha/Hora), pero
+    SUMA las unidades de una misma central en una sola columna -- una central
+    con varias unidades (p.ej. "C.E. PUNTA LOMITAS-BL1" y "-BL2") queda como
+    una única columna con la generación total de la central. El encabezado
+    final tiene 2 niveles (Empresa, Central), no 3 -- ya no aparece la
+    Unidad.
 
     Como no todas las centrales generan todos los meses, el conjunto de
     columnas cambia de un mes a otro. Al consolidar varios meses con
-    pd.concat(axis=0), las columnas se UNEN automáticamente: una central que
-    no generó en un mes queda con celdas vacías ese mes, pero conserva su
-    propia columna en vez de perderse o romper la tabla.
+    pd.concat(axis=0), las columnas se UNEN automáticamente. A diferencia de
+    versiones anteriores, los huecos (central que no generó ese mes, o
+    intervalo sin dato) quedan en 0 en vez de NaN -- Power BI no lee bien los
+    NaN. Para no perder la información de "esta central no tuvo dato ese
+    mes" (distinto de "generó cero"), esta función devuelve además una
+    auditoría: (tabla, auditoria), donde auditoria tiene una fila por Central
+    de este mes con una columna booleana "Operó".
     """
     vista = pd.read_excel(io.BytesIO(contenido), header=None)
 
@@ -440,10 +445,38 @@ def _parsear_vertical_coes(contenido: bytes) -> pd.DataFrame:
     if col_total is not None:
         tabla[("(TOTAL)", "(TOTAL)", "(TOTAL)")] = datos.iloc[:, col_total]
 
+    # Agrupar las unidades de cada central, para sumarlas en una sola
+    # columna (el encabezado final solo muestra Empresa, Central -- ya no
+    # Unidad). Antes de sumar, se registra si la central tuvo AL MENOS UN
+    # valor real (no nulo) en este mes -- esa es la auditoría de "operó/no
+    # operó", y hay que calcularla ANTES de sumar porque la suma rellena con
+    # 0 (no dejaría forma de distinguir "generó 0" de "no hay dato").
+    grupos = {}
+    for empresa, central, _unidad in tabla.columns:
+        grupos.setdefault((empresa, central), []).append((empresa, central, _unidad))
+
+    auditoria_filas = []
+    tabla_por_central = pd.DataFrame(index=tabla.index)
+    for (empresa, central), cols in grupos.items():
+        sub = tabla[cols]
+        opero = bool(sub.notna().any().any())
+        if (empresa, central) != ("(TOTAL)", "(TOTAL)"):
+            auditoria_filas.append({"Empresa": empresa, "Central": central, "Operó": opero})
+        # Con al menos un dato real, se suma tratando los huecos como 0
+        # (comportamiento normal de .sum()); si la central no operó nada
+        # este mes, la fila igual queda en 0 -- ya está reflejado en la
+        # auditoría de arriba, así que no hace falta dejarla en blanco.
+        tabla_por_central[(empresa, central)] = sub.sum(axis=1)
+    tabla_por_central.columns = pd.MultiIndex.from_tuples(
+        tabla_por_central.columns, names=["Empresa", "Central"]
+    )
+    tabla = tabla_por_central
+    auditoria = pd.DataFrame(auditoria_filas)
+
     tabla.index = fecha_hora
     tabla = tabla[tabla.index.notna()]  # descarta filas de resumen/nota al pie (sin fecha válida)
     tabla.index.name = "Fecha/Hora"
-    return tabla.reset_index()
+    return tabla.reset_index(), auditoria
 
 
 def _quitar_filas_resumen_pie(df: pd.DataFrame) -> pd.DataFrame:
@@ -462,20 +495,23 @@ def _quitar_filas_resumen_pie(df: pd.DataFrame) -> pd.DataFrame:
     return df[fechas.notna()].reset_index(drop=True)
 
 
-def _parsear_contenido_coes(contenido: bytes, formato_val: str) -> pd.DataFrame:
+def _parsear_contenido_coes(contenido: bytes, formato_val: str) -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """Convierte los bytes crudos (Excel o CSV) devueltos por COES en un
-    DataFrame limpio.
+    DataFrame limpio. Devuelve (df, auditoria).
 
     - 'Excel Vertical' (formato_val == '2'): tiene un encabezado jerárquico de
       varias filas (medidor/empresa/central/unidad) y una columna por unidad
       de generación, que varía mes a mes. Usa el parser dedicado
-      _parsear_vertical_coes, que lo convierte a formato largo.
+      _parsear_vertical_coes, que lo convierte a formato ancho sumado por
+      central y devuelve también la auditoría de qué central operó ese mes.
     - 'Excel Horizontal' (formato_val == '1') y CSV: tienen un encabezado de
       una sola fila (FECHA, PUNTO MEDICIÓN, EMPRESA, CENTRAL, UNIDAD, ... y
       columnas de horario 00:15-24:00). Usan detección dinámica de la fila de
       encabezado (por si trae metadata arriba), descartan columnas líder
       vacías, y quitan las filas de resumen/pie de página que COES agrega
       después de los datos reales de cada mes (_quitar_filas_resumen_pie).
+      Acá Central es un valor de fila (no un encabezado), así que la
+      auditoría no aplica -- se devuelve None.
     """
     if formato_val == "2":  # Excel Vertical
         return _parsear_vertical_coes(contenido)
@@ -503,7 +539,7 @@ def _parsear_contenido_coes(contenido: bytes, formato_val: str) -> pd.DataFrame:
     if col_empresa is not None:
         df[col_empresa] = df[col_empresa].map(_normalizar_empresa)
 
-    return df
+    return df, None
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -535,20 +571,23 @@ def _descargar_y_leer(ini, fin, empresas_val, tipo_gen_val, central_val, paramet
     if error:
         raise RuntimeError(error)
 
-    df = _parsear_contenido_coes(contenido, formato_val)
+    df, auditoria = _parsear_contenido_coes(contenido, formato_val)
 
     if df.empty:
         raise RuntimeError("El archivo se descargó pero no contiene filas (posible mezcla de tramos).")
 
     if isinstance(df.columns, pd.MultiIndex):
-        # Formato Vertical (tabla ancha, encabezado de 3 niveles): no se le
+        # Formato Vertical (tabla ancha, encabezado de 2 niveles): no se le
         # agrega Tramo_Consultado porque no calza con columnas de varios
         # niveles, y de todas formas la columna Fecha/Hora ya identifica a
         # qué mes pertenece cada fila.
-        return df
+        if auditoria is not None and not auditoria.empty:
+            auditoria = auditoria.copy()
+            auditoria.insert(0, "Tramo", rango_str)
+        return df, auditoria
 
     df.insert(0, "Tramo_Consultado", rango_str)
-    return df
+    return df, auditoria
 
 
 def _procesar_tramos_secuencial(
@@ -568,19 +607,21 @@ def _procesar_tramos_secuencial(
     pero elimina ese choque de raíz en vez de solo mitigarlo.
     """
     dataframes = []
+    auditorias = []
     errores = []
     total = len(tramos)
 
     for i, (ini, fin) in enumerate(tramos, start=1):
         rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
         df_mes = None
+        auditoria_mes = None
         ultimo_error = None
 
         for intento in range(max_reintentos + 1):
             sufijo = f" (reintento {intento}/{max_reintentos})" if intento else ""
             estado.text(f"Descargando {i}/{total} ({rango_str}){sufijo}...")
             try:
-                df_mes = _descargar_y_leer(
+                df_mes, auditoria_mes = _descargar_y_leer(
                     ini, fin, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val,
                 )
                 break
@@ -591,12 +632,14 @@ def _procesar_tramos_secuencial(
 
         if df_mes is not None:
             dataframes.append(df_mes)
+            if auditoria_mes is not None and not auditoria_mes.empty:
+                auditorias.append(auditoria_mes)
         else:
             errores.append((rango_str, f"Falló tras {max_reintentos + 1} intento(s). Último error: {ultimo_error}"))
 
         progreso.progress(i / total)
 
-    return dataframes, errores
+    return dataframes, auditorias, errores
 
 
 # ─────────────────────────────────────────────────────────────
@@ -746,7 +789,7 @@ if submitted:
     # Antes esto se hacía con varios hilos en paralelo, pero el servidor de
     # COES arma el reporte en un único archivo fijo en disco (no uno por
     # sesión) y eso hacía que las descargas paralelas chocaran entre sí.
-    dataframes, errores = _procesar_tramos_secuencial(
+    dataframes, auditorias, errores = _procesar_tramos_secuencial(
         tramos, empresas_val, tipo_gen_val, central_val, parametros_val, formato_val,
         max_reintentos, progreso, estado,
     )
@@ -770,16 +813,31 @@ if submitted:
     if dataframes:
         df_final = pd.concat(dataframes, ignore_index=True, sort=False)
         es_formato_vertical = isinstance(df_final.columns, pd.MultiIndex)
+        df_auditoria = None
         if es_formato_vertical:
             # Formato Vertical (tabla ancha): puede haber quedado más de una
             # fila para la misma Fecha/Hora si algún tramo se reintentó y se
             # sumó dos veces; y conviene ordenar cronológicamente.
-            col_fecha_hora = ("Fecha/Hora", "", "")
+            col_fecha_hora = ("Fecha/Hora", "")
             df_final = (
                 df_final.drop_duplicates(subset=[col_fecha_hora])
                 .sort_values(col_fecha_hora)
                 .reset_index(drop=True)
             )
+            # Los huecos que deja pd.concat (una central que no generó ese
+            # mes, y por lo tanto no tenía esa columna en ese tramo) quedan
+            # en 0 en vez de NaN -- Power BI no lee bien los NaN. La
+            # auditoría (más abajo) es la que conserva la información de
+            # qué central no tuvo dato en qué mes.
+            columnas_dato = [c for c in df_final.columns if c != col_fecha_hora]
+            df_final[columnas_dato] = df_final[columnas_dato].fillna(0)
+
+            if auditorias:
+                df_auditoria = (
+                    pd.concat(auditorias, ignore_index=True)
+                    .sort_values(["Empresa", "Central", "Tramo"])
+                    .reset_index(drop=True)
+                )
 
         if len(dataframes) == len(tramos):
             st.success(
@@ -794,6 +852,20 @@ if submitted:
 
         with st.expander("👀 Ver columnas detectadas (para verificar que el encabezado se leyó bien)"):
             st.write(list(df_final.columns))
+
+        if df_auditoria is not None:
+            centrales_con_hueco = df_auditoria.loc[~df_auditoria["Operó"], ["Empresa", "Central", "Tramo"]]
+            with st.expander(
+                f"🔍 Auditoría: qué central operó cada mes "
+                f"({len(centrales_con_hueco)} hueco(s) detectado(s))",
+                expanded=len(centrales_con_hueco) > 0,
+            ):
+                st.caption(
+                    "Los valores en la tabla están en 0 cuando una central no tuvo dato "
+                    "ese mes (no NaN, para que Power BI los lea bien). Esta auditoría es "
+                    "la forma de distinguir 'generó 0' de 'no hay dato ese mes'."
+                )
+                st.dataframe(df_auditoria, use_container_width=True)
 
         st.dataframe(df_final.head(300), use_container_width=True)
 
@@ -810,10 +882,12 @@ if submitted:
                 # niveles e index=False, así que Fecha/Hora se pasa a ser el
                 # índice real solo para este paso (queda igual de visible,
                 # como primera columna, pero sin duplicar información).
-                col_fecha_hora = ("Fecha/Hora", "", "")
+                col_fecha_hora = ("Fecha/Hora", "")
                 df_excel = df_final.set_index(col_fecha_hora)
                 df_excel.index.name = "Fecha/Hora"
                 df_excel.to_excel(writer, index=True, sheet_name="MedidoresGeneracion")
+                if df_auditoria is not None:
+                    df_auditoria.to_excel(writer, index=False, sheet_name="Auditoria")
             else:
                 df_final.to_excel(writer, index=False, sheet_name="MedidoresGeneracion")
         st.download_button(
