@@ -14,7 +14,6 @@ import unicodedata
 from calendar import monthrange
 from datetime import date, timedelta
 from pathlib import Path
-from threading import Lock
 
 import pandas as pd
 import requests
@@ -183,17 +182,22 @@ FORMATOS = {
 
 FORMATO_EXTENSION = {"1": "xlsx", "2": "xlsx", "3": "csv"}
 
-URL_PAGINA          = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion"
-URL_VALIDAR_EXPORT  = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/validarexportacion"
-URL_EXPORTAR        = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/exportar"
-URL_DESCARGAR       = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/descargar"
+URL_PAGINA   = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion"
+URL_EXPORTAR = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/Exportar"
 
-MENSAJES_VALIDACION = {
-    2: "El lapso de tiempo no puede ser mayor a 1 mes.",
-    3: "Para la exportación a CSV solo debe seleccionar un parámetro.",
-    4: "Seleccione un parámetro a exportar.",
-    -1: "Ha ocurrido un error en el servidor al validar la exportación.",
-}
+def validar_antes_de_exportar(fecha_inicial: date, fecha_final: date, parametros: str, tipo: str) -> str | None:
+    """Replica las validaciones que hace medidores.js (exportarFormato) ANTES
+    de armar la URL de exportación, para fallar rápido con un mensaje claro
+    en vez de gastar una petición que el servidor rechazaría igual.
+    Devuelve un mensaje de error, o None si está todo bien."""
+    if (fecha_final - fecha_inicial).days > 31:
+        return "El lapso de tiempo no puede ser mayor a 1 mes."
+    lista_parametros = [p for p in parametros.split(",") if p]
+    if tipo == "3" and len(lista_parametros) != 1:
+        return "Para la exportación a CSV solo debe seleccionar un parámetro."
+    if not lista_parametros:
+        return "Seleccione un parámetro a exportar."
+    return None
 
 HEADERS = {
     "User-Agent": (
@@ -201,26 +205,16 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
     "Referer": URL_PAGINA,
-    "Origin": "https://www.coes.org.pe",
-    "X-Requested-With": "XMLHttpRequest",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
+    # El flujo real (medidores.js) exporta con window.open(url) -- una
+    # navegación normal del navegador, no una llamada $.ajax(). Por eso NO
+    # se manda "X-Requested-With: XMLHttpRequest" aquí (antes sí se mandaba,
+    # heredado de cuando el código pensaba que "Exportar" era un endpoint
+    # AJAX como los demás, p.ej. "empresas" o "ValidarParametro", que sí lo
+    # necesitan y si acaso se llaman aparte).
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# ─────────────────────────────────────────────────────────────
-#  LOCK GLOBAL para el tramo crítico exportar->descargar.
-#
-#  El servidor de COES genera el archivo en el paso "exportar" y
-#  lo entrega en el paso "descargar" (aparentemente usando algo
-#  ligado a la sesión/carpeta temporal en el servidor, no 100%
-#  aislado por request). Si dos hilos hacen "exportar" casi al
-#  mismo tiempo, uno puede sobreescribir el archivo del otro antes
-#  de que este lo descargue -> tramos con datos equivocados, vacíos
-#  o corruptos, de forma no determinística.
-#
-#  Serializamos SOLO ese tramo crítico (no toda la descarga) para
-#  seguir aprovechando paralelismo en el resto del flujo.
-# ─────────────────────────────────────────────────────────────
-_export_lock = Lock()
+
 
 
 def _session() -> requests.Session:
@@ -249,88 +243,50 @@ def descargar_medidores_generacion(
     tipos_empresa: str = "",
 ):
     """
-    Replica el flujo real del sitio (medidores.js -> exportarFormato):
-      1) POST validarexportacion
-      2) POST exportar          ─┐
-      3) GET  descargar?tipo=... ┘ SECCIÓN CRÍTICA (con lock)
+    Replica el flujo REAL actual del sitio (medidores.js -> exportarFormato):
+    una ÚNICA petición GET a ".../medidoresgeneracion/Exportar" con todos los
+    parámetros en la URL. Así es como lo hace el botón "Exportar Datos" del
+    portal: arma `controlador + "Exportar?" + $.param(modelo)` y hace
+    `window.open(enlace)` -- el navegador simplemente navega a esa URL y
+    descarga el archivo que el servidor devuelve directo, sin pasos previos.
+
+    Esto reemplaza un flujo anterior de 3 pasos (validarexportacion + POST
+    exportar + GET descargar) que ya no coincide con el sitio real: ese flujo
+    devolvía 404 en el paso "exportar" para absolutamente todos los meses
+    probados, lo que confirmó que esos endpoints separados ya no existen (se
+    revisó el medidores.js real servido por COES para corregirlo).
 
     Devuelve (contenido_bytes, nombre_archivo, mensaje_error).
     """
     s = _session()
 
-    # ── Paso 1: validar (esto sí es seguro en paralelo) ─────────
-    payload_validar = {
-        "formato": tipo,
+    params = {
         "fechaInicial": fecha_inicial,
         "fechaFinal": fecha_final,
+        "tiposEmpresa": tipos_empresa,
+        "empresas": empresas,
+        "tiposGeneracion": tipos_generacion,
+        "central": central,
         "parametros": parametros,
+        "tipo": tipo,
     }
+
     try:
-        resp1 = s.post(URL_VALIDAR_EXPORT, data=payload_validar, timeout=60)
+        resp = s.get(URL_EXPORTAR, params=params, timeout=90)
     except requests.RequestException as e:
-        return None, None, f"Error de conexión en validarexportacion: {e}"
+        return None, None, f"Error de conexión en Exportar: {e}"
 
-    if resp1.status_code != 200:
-        return None, None, f"HTTP {resp1.status_code} en validarexportacion: {resp1.text[:300]}"
+    if resp.status_code != 200:
+        return None, None, f"HTTP {resp.status_code} en Exportar: {resp.text[:300]}"
 
-    try:
-        resultado_validar = resp1.json()
-    except ValueError:
-        return None, None, f"Respuesta inesperada en validarexportacion: {resp1.text[:300]}"
+    content_type = resp.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        # El servidor devolvió una página (de error, de login, de aviso) en
+        # vez del archivo -- por ejemplo, si algún parámetro no aplica para
+        # ese mes/central en particular.
+        return None, None, f"COES devolvió una página HTML en vez de un archivo: {resp.text[:300]}"
 
-    if resultado_validar != 1:
-        mensaje = MENSAJES_VALIDACION.get(
-            resultado_validar, f"Validación falló con código {resultado_validar!r}"
-        )
-        return None, None, mensaje
-
-    # ── Pasos 2 y 3: exportar + descargar. Deben ser atómicos ───
-    # respecto a otros hilos, porque el servidor genera el archivo
-    # en el paso 2 y lo sirve en el paso 3.
-    with _export_lock:
-        payload_exportar = {
-            "fechaInicial": fecha_inicial,
-            "fechaFinal": fecha_final,
-            "tiposEmpresa": tipos_empresa,
-            "empresas": empresas,
-            "tiposGeneracion": tipos_generacion,
-            "central": central,
-            "parametros": parametros,
-            "tipo": tipo,
-        }
-        try:
-            resp2 = s.post(URL_EXPORTAR, data=payload_exportar, timeout=90)
-        except requests.RequestException as e:
-            return None, None, f"Error de conexión en exportar: {e}"
-
-        if resp2.status_code != 200:
-            return None, None, f"HTTP {resp2.status_code} en exportar: {resp2.text[:300]}"
-
-        try:
-            resultado_exportar = resp2.json()
-        except ValueError:
-            return None, None, f"Respuesta inesperada en exportar: {resp2.text[:300]}"
-
-        if str(resultado_exportar) != "1":
-            return None, None, f"exportar devolvió un error: {resultado_exportar!r}"
-
-        try:
-            resp3 = s.get(URL_DESCARGAR, params={"tipo": tipo}, timeout=90)
-        except requests.RequestException as e:
-            return None, None, f"Error de conexión en descargar: {e}"
-
-        # El servidor de COES usa un único archivo fijo en disco para armar
-        # este reporte (no uno por sesión) -- el mensaje de error observado,
-        # "Error saving file D:\...\ReporteMedidores_Vertical.xlsx", confirma
-        # que puede seguir escribiendo ese archivo en segundo plano después de
-        # responder. Esta pequeña pausa (todavía dentro del lock) le da tiempo
-        # a terminar antes de que el siguiente hilo intente exportar de nuevo.
-        time.sleep(1.5)
-
-    if resp3.status_code != 200:
-        return None, None, f"HTTP {resp3.status_code} en descargar: {resp3.text[:300]}"
-
-    if not resp3.content or len(resp3.content) < 100:
+    if not resp.content or len(resp.content) < 100:
         return None, None, "El servidor devolvió un archivo vacío o demasiado pequeño."
 
     ext_default = FORMATO_EXTENSION.get(tipo, "xlsx")
@@ -338,10 +294,10 @@ def descargar_medidores_generacion(
         f"MedidoresGeneracion_{fecha_inicial.replace('/', '')}_"
         f"{fecha_final.replace('/', '')}.{ext_default}"
     )
-    nombre = _nombre_desde_content_disposition(resp3, default=nombre_default)
+    nombre = _nombre_desde_content_disposition(resp, default=nombre_default)
     nombre = unicodedata.normalize("NFKD", nombre).encode("ascii", "ignore").decode()
 
-    return resp3.content, nombre, None
+    return resp.content, nombre, None
 
 
 def dividir_en_meses(fecha_inicio: date, fecha_fin: date):
@@ -534,6 +490,11 @@ def _descargar_y_leer(ini, fin, empresas_val, tipo_gen_val, central_val, paramet
     descarga falla (excepción), Streamlit NO cachea ese resultado, así que el
     reintento sí vuelve a pedirlo al servidor como corresponde."""
     rango_str = f"{ini.strftime('%d/%m/%Y')} - {fin.strftime('%d/%m/%Y')}"
+
+    error_validacion = validar_antes_de_exportar(ini, fin, parametros_val, formato_val)
+    if error_validacion:
+        raise RuntimeError(error_validacion)
+
     contenido, nombre, error = descargar_medidores_generacion(
         fecha_inicial=ini.strftime("%d/%m/%Y"),
         fecha_final=fin.strftime("%d/%m/%Y"),
@@ -846,4 +807,3 @@ if submitted:
         )
     else:
         st.error("No se pudo descargar ningún tramo.")
-
