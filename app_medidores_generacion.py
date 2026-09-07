@@ -348,6 +348,27 @@ def _detectar_fila_en_vista(vista: pd.DataFrame) -> int:
     return mejor_fila
 
 
+# COES ha usado más de un nombre para la misma empresa en distintos períodos
+# (p.ej. "ENGIE" en registros de 2025, y la razón social completa "ENGIE
+# ENERGIA PERU S.A.A." desde 2025-2026 en adelante -- mismas 24 unidades de
+# generación en ambos casos). Sin esto, un rango que cruza ese cambio queda
+# separado como si fueran dos empresas distintas. Las claves van en
+# MAYÚSCULAS sin tildes para que la comparación sea insensible a acentos.
+NORMALIZACION_EMPRESA = {
+    "ENGIE": "ENGIE ENERGIA PERU S.A.A.",
+}
+
+
+def _normalizar_empresa(nombre):
+    """Unifica nombres de empresa que representan la misma compañía pero
+    aparecen distinto según el período (ver NORMALIZACION_EMPRESA)."""
+    if nombre is None or (isinstance(nombre, float) and pd.isna(nombre)):
+        return nombre
+    clave = unicodedata.normalize("NFKD", str(nombre).strip().upper())
+    clave = "".join(c for c in clave if not unicodedata.combining(c))
+    return NORMALIZACION_EMPRESA.get(clave, nombre)
+
+
 def _parsear_vertical_coes(contenido: bytes) -> pd.DataFrame:
     """Parser específico para el formato 'Excel Vertical' de COES.
 
@@ -397,8 +418,9 @@ def _parsear_vertical_coes(contenido: bytes) -> pd.DataFrame:
             col_total = col_idx
         elif pd.notna(fila_unidad.iloc[col_idx]):
             col_indices.append(col_idx)
+            empresa_raw = fila_empresa.iloc[col_idx] if pd.notna(fila_empresa.iloc[col_idx]) else ""
             columnas.append((
-                fila_empresa.iloc[col_idx] if pd.notna(fila_empresa.iloc[col_idx]) else "",
+                _normalizar_empresa(empresa_raw) if empresa_raw != "" else "",
                 fila_central.iloc[col_idx] if pd.notna(fila_central.iloc[col_idx]) else "",
                 fila_unidad.iloc[col_idx],
             ))
@@ -475,7 +497,13 @@ def _parsear_contenido_coes(contenido: bytes, formato_val: str) -> pd.DataFrame:
         df = df.drop(columns=df.columns[0])
 
     df = df.dropna(how="all").reset_index(drop=True)
-    return _quitar_filas_resumen_pie(df)
+    df = _quitar_filas_resumen_pie(df)
+
+    col_empresa = next((c for c in df.columns if str(c).strip().upper() == "EMPRESA"), None)
+    if col_empresa is not None:
+        df[col_empresa] = df[col_empresa].map(_normalizar_empresa)
+
+    return df
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
