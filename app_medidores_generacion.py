@@ -369,6 +369,32 @@ def _normalizar_empresa(nombre):
     return NORMALIZACION_EMPRESA.get(clave, nombre)
 
 
+def _clave_normalizada(nombre) -> str:
+    """Mayúsculas, sin tildes, sin espacios de más -- para comparar nombres
+    (de empresa o central) de forma insensible a esas diferencias menores."""
+    if nombre is None or (isinstance(nombre, float) and pd.isna(nombre)):
+        return ""
+    clave = unicodedata.normalize("NFKD", str(nombre).strip().upper())
+    clave = "".join(c for c in clave if not unicodedata.combining(c))
+    return " ".join(clave.split())
+
+
+# Lista por defecto de centrales a incluir en el resultado final. Se puede
+# editar libremente acá, y también se puede ajustar desde la app (el
+# multiselect en "Opciones avanzadas" parte de esta lista, pero se puede
+# cambiar sin tocar código). Una lista vacía == incluir todas las centrales.
+CENTRALES_A_INCLUIR_DEFAULT = [
+    "C.E. PUNTA LOMITAS",
+    "C.E. PUNTA LOMITAS_EXP",
+    "C.H. QUITARACSA",
+    "C.H. YUNCAN",
+    "C.S. INTIPAMPA",
+    "C.S. EXPANSIÓN INTIPAMPA",
+    "C.E. DUNA",
+    "C.E. HUAMBOS",
+]
+
+
 def _parsear_vertical_coes(contenido: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Parser específico para el formato 'Excel Vertical' de COES.
 
@@ -849,6 +875,47 @@ if submitted:
                 f"Consolidado parcial — {len(dataframes)} de {len(tramos)} tramos "
                 f"({len(df_final):,} filas en total). Revisa los tramos fallidos arriba."
             )
+
+        # ── Filtro de centrales ──────────────────────────────────────
+        # Las opciones son las centrales REALMENTE detectadas en esta
+        # descarga (no una lista fija), para no depender de que los nombres
+        # coincidan letra por letra con CENTRALES_A_INCLUIR_DEFAULT. La
+        # preselección sí parte de esa lista, comparando de forma insensible
+        # a mayúsculas/tildes/espacios (ver _clave_normalizada), así que
+        # variantes menores como "C.S. EXP. INTIPAMPA" vs "C.S. EXPANSIÓN
+        # INTIPAMPA" igual quedan preseleccionadas.
+        if es_formato_vertical:
+            centrales_detectadas = sorted({
+                central for _empresa, central in df_final.columns
+                if central not in ("(TOTAL)", "")
+            })
+        else:
+            col_central = next((c for c in df_final.columns if str(c).strip().upper() == "CENTRAL"), None)
+            centrales_detectadas = sorted(df_final[col_central].dropna().unique()) if col_central else []
+
+        if centrales_detectadas:
+            claves_default = {_clave_normalizada(c) for c in CENTRALES_A_INCLUIR_DEFAULT}
+            preseleccion = [c for c in centrales_detectadas if _clave_normalizada(c) in claves_default] or centrales_detectadas
+
+            centrales_sel = st.multiselect(
+                "Centrales a incluir en el resultado final",
+                options=centrales_detectadas,
+                default=preseleccion,
+                help="Solo se muestran/exportan las centrales seleccionadas. Por defecto "
+                     "vienen preseleccionadas las de CENTRALES_A_INCLUIR_DEFAULT (editable "
+                     "en el código); puedes ajustar la selección libremente acá.",
+            )
+
+            if centrales_sel and set(centrales_sel) != set(centrales_detectadas):
+                if es_formato_vertical:
+                    columnas_mantener = [col_fecha_hora] + [
+                        c for c in df_final.columns if c != col_fecha_hora and c[1] in centrales_sel
+                    ]
+                    df_final = df_final[columnas_mantener]
+                else:
+                    df_final = df_final[df_final[col_central].isin(centrales_sel)].reset_index(drop=True)
+                if df_auditoria is not None:
+                    df_auditoria = df_auditoria[df_auditoria["Central"].isin(centrales_sel)].reset_index(drop=True)
 
         with st.expander("👀 Ver columnas detectadas (para verificar que el encabezado se leyó bien)"):
             st.write(list(df_final.columns))
