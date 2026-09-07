@@ -311,14 +311,76 @@ def descargar_medidores_generacion(
 
 def parsear_a_dataframe(contenido: bytes, tipo: str, hoja: int | str = 0) -> pd.DataFrame:
     """
-    Convierte los bytes crudos devueltos por el COES en un DataFrame.
-    tipo: '1' (Excel Horizontal), '2' (Excel Vertical) o '3' (CSV).
-    `hoja` selecciona la hoja del Excel si el archivo tiene varias
-    (por defecto la primera).
+    Convierte los bytes crudos devueltos por el COES en un DataFrame "limpio".
+
+    Soporta tanto un único exporte por archivo como varios exportes pegados
+    uno tras otro dentro de la misma hoja (cada uno con su propio bloque de
+    título/encabezado/datos/TOTAL) — esto último pasa si se concatenan
+    exportaciones mensuales crudas en un solo archivo.
+
+    Para cada bloque:
+    - Ubica automáticamente la fila de encabezado real (la que contiene "FECHA"),
+      sin importar cuántas filas de título/metadata haya arriba (normalmente
+      empieza en B10, pero esto no depende de esa posición fija).
+    - Descarta la columna A (vacía) y cualquier columna basura sin nombre real.
+    - Se queda solo con las columnas de datos conocidas (FECHA, PUNTO MEDICIÓN,
+      EMPRESA, CENTRAL, UNIDAD) más las columnas de intervalos horarios
+      (formato "HH:MM"), descartando la columna "TOTAL ENERGIA ACTIVA (MWh)"
+      y cualquier otra columna de total.
+    - Corta las filas justo antes de las filas de resumen del pie de página
+      ("TOTAL ENERGÍA...", "TOTAL POTENCIA...", "Leyenda", etc.), o antes del
+      siguiente bloque si lo hay.
+    - Si el COES agrega más columnas de intervalo en el futuro, se incluyen
+      automáticamente (calzan con el patrón HH:MM); si agrega un campo fijo
+      nuevo, hay que sumarlo a `campos_fijos`.
+
+    Todos los bloques encontrados se concatenan en un solo DataFrame.
     """
     if tipo == "3":
         return pd.read_csv(io.BytesIO(contenido))
-    return pd.read_excel(io.BytesIO(contenido), sheet_name=hoja, engine="openpyxl")
+
+    raw = pd.read_excel(io.BytesIO(contenido), sheet_name=hoja, header=None, engine="openpyxl")
+    raw_norm = raw.astype(str).apply(lambda col: col.str.strip().str.upper())
+
+    # Puede haber más de un bloque "FECHA...datos...TOTAL" pegado en la misma hoja
+    filas_header = raw_norm.index[(raw_norm == "FECHA").any(axis=1)].tolist()
+    if not filas_header:
+        raise ValueError("No se encontró ninguna fila de encabezado ('FECHA') en el archivo.")
+
+    campos_fijos = {"FECHA", "PUNTO MEDICIÓN", "EMPRESA", "CENTRAL", "UNIDAD"}
+    patron_hora = re.compile(r"^\d{2}:\d{2}$")
+    bloques = []
+
+    for idx, fila_header in enumerate(filas_header):
+        limite_bloque = filas_header[idx + 1] if idx + 1 < len(filas_header) else len(raw)
+
+        encabezados = raw.iloc[fila_header]
+        datos = raw.iloc[fila_header + 1 : limite_bloque].copy()
+        datos.columns = encabezados
+        datos = datos.loc[:, datos.columns.notna()]  # descarta columna A y basura sin nombre
+
+        col_fecha_cand = datos.columns[datos.columns.astype(str).str.strip().str.upper() == "FECHA"]
+        if len(col_fecha_cand) == 0:
+            continue
+        col_fecha = col_fecha_cand[0]
+
+        marca = datos[col_fecha].astype(str).str.strip().str.upper()
+        fin_datos = datos[col_fecha].isna() | marca.str.startswith("TOTAL") | marca.eq("LEYENDA") | marca.eq("NAN")
+        if fin_datos.any():
+            datos = datos.loc[: fin_datos.idxmax() - 1]
+
+        cols_validas = [
+            c
+            for c in datos.columns
+            if str(c).strip().upper() in campos_fijos or patron_hora.match(str(c).strip())
+        ]
+        if not datos.empty:
+            bloques.append(datos[cols_validas])
+
+    if not bloques:
+        raise ValueError("Se encontraron encabezados pero ningún bloque tenía datos válidos.")
+
+    return pd.concat(bloques, ignore_index=True)
 
 
 # ---------------------------------------------------------------------------
