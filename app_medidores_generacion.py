@@ -309,6 +309,21 @@ def descargar_medidores_generacion(
     return resp.content, content_type, nombre_archivo
 
 
+def _normalizar_texto(valor) -> str:
+    """
+    Limpia texto de celdas de Excel de forma robusta: quita espacios NBSP
+    (\\xa0), zero-width spaces (\\u200b) y similares que el sitio del COES
+    a veces mete en su HTML/Excel (ya vimos uno en el propio <title> de la
+    página: "Medi​dores"), colapsa espacios múltiples, y normaliza a
+    mayúsculas sin espacios al borde.
+    """
+    s = str(valor)
+    for invisible in ("\u200b", "\u200c", "\u200d", "\ufeff", "\xa0"):
+        s = s.replace(invisible, " " if invisible == "\xa0" else "")
+    s = re.sub(r"\s+", " ", s).strip().upper()
+    return s
+
+
 def parsear_a_dataframe(contenido: bytes, tipo: str, hoja: int | str = 0) -> pd.DataFrame:
     """
     Convierte los bytes crudos devueltos por el COES en un DataFrame "limpio".
@@ -321,7 +336,9 @@ def parsear_a_dataframe(contenido: bytes, tipo: str, hoja: int | str = 0) -> pd.
     Para cada bloque:
     - Ubica automáticamente la fila de encabezado real (la que contiene "FECHA"),
       sin importar cuántas filas de título/metadata haya arriba (normalmente
-      empieza en B10, pero esto no depende de esa posición fija).
+      empieza en B10, pero esto no depende de esa posición fija). La búsqueda
+      normaliza el texto de cada celda (ver `_normalizar_texto`) para tolerar
+      espacios invisibles que el COES a veces incluye.
     - Descarta la columna A (vacía) y cualquier columna basura sin nombre real.
     - Se queda solo con las columnas de datos conocidas (FECHA, PUNTO MEDICIÓN,
       EMPRESA, CENTRAL, UNIDAD) más las columnas de intervalos horarios
@@ -335,17 +352,28 @@ def parsear_a_dataframe(contenido: bytes, tipo: str, hoja: int | str = 0) -> pd.
       nuevo, hay que sumarlo a `campos_fijos`.
 
     Todos los bloques encontrados se concatenan en un solo DataFrame.
+
+    Si no se encuentra ninguna fila de encabezado, se levanta un ValueError
+    cuyo mensaje incluye una vista previa cruda de las primeras filas/columnas
+    del archivo, para poder diagnosticar por qué no calzó la detección.
     """
     if tipo == "3":
         return pd.read_csv(io.BytesIO(contenido))
 
     raw = pd.read_excel(io.BytesIO(contenido), sheet_name=hoja, header=None, engine="openpyxl")
-    raw_norm = raw.astype(str).apply(lambda col: col.str.strip().str.upper())
+    raw_norm = raw.map(_normalizar_texto)
 
     # Puede haber más de un bloque "FECHA...datos...TOTAL" pegado en la misma hoja
     filas_header = raw_norm.index[(raw_norm == "FECHA").any(axis=1)].tolist()
     if not filas_header:
-        raise ValueError("No se encontró ninguna fila de encabezado ('FECHA') en el archivo.")
+        preview_rows = min(15, len(raw))
+        preview_cols = min(6, raw.shape[1])
+        preview = raw.iloc[:preview_rows, :preview_cols].to_string()
+        raise ValueError(
+            "No se encontró ninguna fila de encabezado ('FECHA') en el archivo.\n"
+            f"Vista previa cruda (primeras {preview_rows} filas x {preview_cols} columnas):\n"
+            f"{preview}"
+        )
 
     campos_fijos = {"FECHA", "PUNTO MEDICIÓN", "EMPRESA", "CENTRAL", "UNIDAD"}
     patron_hora = re.compile(r"^\d{2}:\d{2}$")
@@ -354,27 +382,27 @@ def parsear_a_dataframe(contenido: bytes, tipo: str, hoja: int | str = 0) -> pd.
     for idx, fila_header in enumerate(filas_header):
         limite_bloque = filas_header[idx + 1] if idx + 1 < len(filas_header) else len(raw)
 
-        encabezados = raw.iloc[fila_header]
+        encabezados_norm = raw_norm.iloc[fila_header]
         datos = raw.iloc[fila_header + 1 : limite_bloque].copy()
-        datos.columns = encabezados
-        datos = datos.loc[:, datos.columns.notna()]  # descarta columna A y basura sin nombre
+        datos.columns = encabezados_norm.values  # ya normalizados: "FECHA", "EMPRESA", "00:15", etc.
+        datos = datos.loc[:, pd.Series(datos.columns).notna().values & (pd.Series(datos.columns) != "NAN").values]
 
-        col_fecha_cand = datos.columns[datos.columns.astype(str).str.strip().str.upper() == "FECHA"]
-        if len(col_fecha_cand) == 0:
+        col_fecha_cand = [c for c in datos.columns if c == "FECHA"]
+        if not col_fecha_cand:
             continue
         col_fecha = col_fecha_cand[0]
 
-        marca = datos[col_fecha].astype(str).str.strip().str.upper()
-        fin_datos = datos[col_fecha].isna() | marca.str.startswith("TOTAL") | marca.eq("LEYENDA") | marca.eq("NAN")
+        marca = datos[col_fecha].map(_normalizar_texto)
+        fin_datos = datos[col_fecha].isna() | marca.str.startswith("TOTAL") | marca.eq("LEYENDA") | marca.eq("NAN") | marca.eq("")
         if fin_datos.any():
             datos = datos.loc[: fin_datos.idxmax() - 1]
 
         cols_validas = [
             c
             for c in datos.columns
-            if str(c).strip().upper() in campos_fijos or patron_hora.match(str(c).strip())
+            if c in campos_fijos or patron_hora.match(str(c).strip())
         ]
-        if not datos.empty:
+        if not datos.empty and cols_validas:
             bloques.append(datos[cols_validas])
 
     if not bloques:
@@ -545,7 +573,8 @@ if enviado:
         if errores:
             with st.expander(f"⚠️ {len(errores)} tramo(s) fallaron", expanded=not dataframes):
                 for rango, msg in errores:
-                    st.write(f"**{rango}**: {msg}")
+                    st.markdown(f"**{rango}**")
+                    st.code(msg)
 
         if dataframes:
             df_final = pd.concat(dataframes, ignore_index=True)
