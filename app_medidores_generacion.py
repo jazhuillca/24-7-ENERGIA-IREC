@@ -2,7 +2,18 @@
 Streamlit app: Descarga el reporte de Medidores de Generación del COES.
 
 Página:   https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion
-Endpoint: POST https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/exportar
+JS real:  /Portal/Areas/Mediciones/Content/Scripts/medidores.js (función exportarFormato)
+
+Hallazgos clave del JS (confirmados leyendo el código fuente real):
+- La exportación es un GET (no POST) a:
+      /Portal/mediciones/medidoresgeneracion/Exportar?<query string>
+  armado con $.param(modelo) y abierto con window.open(enlace, '_blank').
+- Campos del query string: fechaInicial, fechaFinal, tiposEmpresa, empresas,
+  tiposGeneracion, central, parametros, tipo.
+- Validaciones que hace el propio JS antes de exportar (las replicamos aquí):
+    * El rango [fechaInicial, fechaFinal] no puede superar 31 días.
+    * Si tipo == '3' (CSV), solo se permite seleccionar 1 parámetro.
+    * Debe haber al menos 1 parámetro seleccionado.
 
 Ejecutar con:
     streamlit run app_medidores_generacion.py
@@ -17,7 +28,8 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 # Configuración fija
 # ---------------------------------------------------------------------------
-URL_EXPORTAR = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/exportar"
+BASE_URL = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion/"
+URL_EXPORTAR = BASE_URL + "Exportar"
 REFERER = "https://www.coes.org.pe/Portal/mediciones/medidoresgeneracion"
 
 DEFAULT_EMPRESAS = (
@@ -32,25 +44,42 @@ DEFAULT_EMPRESAS = (
     "11395,13783,18,48,10582,11064,47,11100,10755,12190,11053,10984,11101,11486,"
     "6,11567,10767,11894"
 )
-DEFAULT_TIPOS_GENERACION = "4,1,3,2"   # ver categorías reales en el <select> del formulario
-DEFAULT_PARAMETROS = "1,2,4,3"          # ver checkboxes de parámetros en el formulario
+DEFAULT_TIPOS_GENERACION = "4,1,3,2"  # EÓLICA, HIDROELÉCTRICA, SOLAR, TERMOELÉCTRICA
 
-FORMATOS = {"Excel (.xlsx)": "2", "CSV": "1"}  # ajustar según valores reales del <select>
+# Parámetros reales vistos en el <select id="cbParametroExportar"> del modal
+PARAMETROS_DISPONIBLES = {
+    "Potencia Activa (MW)": "1",
+    "Potencia Reactiva (MW)": "5",
+    "Servicios Auxiliares": "3",
+    "Potencia Reactiva Capacitiva (MVAR)": "2",
+    "Potencia Reactiva Inductiva (MVAR)": "4",
+}
+
+# Valores del <select id="cbCentral">
+CENTRAL_OPCIONES = {"TODOS": "0", "COES": "1", "GENERACION RER": "3"}
+
+# Valores de los radio buttons rbFormato
+FORMATOS = {
+    "Excel Horizontal": "1",
+    "Excel Vertical": "2",
+    "CSV": "3",
+}
+
+MAX_DIAS_RANGO = 31  # límite real que impone el JS del COES
 
 
 # ---------------------------------------------------------------------------
-# Lógica de descarga (adaptada del script original)
+# Lógica de descarga (replicando exportarFormato del JS real)
 # ---------------------------------------------------------------------------
 def _session() -> requests.Session:
     s = requests.Session()
     s.headers.update(
         {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "X-Requested-With": "XMLHttpRequest",
             "Referer": REFERER,
-            "Origin": "https://www.coes.org.pe",
         }
     )
+    # Visitamos la página primero para obtener cualquier cookie de sesión necesaria
     s.get(REFERER, timeout=30)
     return s
 
@@ -58,48 +87,46 @@ def _session() -> requests.Session:
 def descargar_medidores_generacion(
     fecha_inicial: str,
     fecha_final: str,
-    empresas: str = DEFAULT_EMPRESAS,
-    tipos_generacion: str = DEFAULT_TIPOS_GENERACION,
+    empresas: str,
+    tipos_generacion: str,
+    parametros: str,
+    tipo: str,
+    tipos_empresa: str = "",
     central: str = "1",
-    parametros: str = DEFAULT_PARAMETROS,
-    tipo: str = "2",
-    formato: str = "2",
 ):
     """
     fecha_inicial / fecha_final: strings en formato dd/mm/yyyy.
+    parametros: string con los códigos separados por coma, ej. "1,5,3".
+    tipo: "1" (Excel Horizontal), "2" (Excel Vertical) o "3" (CSV).
 
     Devuelve (contenido_bytes, content_type, nombre_archivo_sugerido) si tuvo éxito,
     o (None, mensaje_error, None) si falló.
     """
     s = _session()
-    payload = {
+
+    # El JS arma esto como querystring con $.param() y hace un GET (window.open)
+    params = {
         "fechaInicial": fecha_inicial,
         "fechaFinal": fecha_final,
+        "tiposEmpresa": tipos_empresa,
         "empresas": empresas,
         "tiposGeneracion": tipos_generacion,
         "central": central,
         "parametros": parametros,
         "tipo": tipo,
-        "formato": formato,
     }
 
-    resp = s.post(URL_EXPORTAR, data=payload, timeout=180)
+    resp = s.get(URL_EXPORTAR, params=params, timeout=180)
     resp.raise_for_status()
 
     content_type = resp.headers.get("Content-Type", "")
-    if "json" in content_type:
-        # El servidor devolvió JSON en vez del archivo -> probablemente es un
-        # flujo en 2 pasos (generar + descargar), como en mantenimientos.
+    if "text/html" in content_type or "json" in content_type:
         mensaje = (
-            f"Respuesta JSON inesperada (Content-Type: {content_type!r}):\n\n"
-            f"{resp.text[:500]}\n\n"
-            "Esto sugiere que 'exportar' solo genera el archivo y falta un "
-            "segundo GET para descargarlo, como en el flujo de mantenimientos. "
-            "Revisa la pestaña Network del navegador para encontrar esa segunda petición."
+            f"Respuesta inesperada (Content-Type: {content_type!r}):\n\n"
+            f"{resp.text[:800]}"
         )
         return None, mensaje, None
 
-    # Intentar extraer un nombre de archivo sugerido por el servidor
     disposition = resp.headers.get("Content-Disposition", "")
     nombre_archivo = "medidores_generacion.xlsx"
     if "filename=" in disposition:
@@ -119,6 +146,13 @@ st.caption(
     "(www.coes.org.pe)."
 )
 
+st.info(
+    f"El propio formulario del COES limita cada exportación a un rango máximo "
+    f"de **{MAX_DIAS_RANGO} días**, y si eliges formato **CSV** solo puedes "
+    f"seleccionar **un** parámetro a la vez.",
+    icon="ℹ️",
+)
+
 with st.form("form_descarga"):
     col1, col2 = st.columns(2)
     hoy = date.today()
@@ -128,6 +162,14 @@ with st.form("form_descarga"):
         )
     with col2:
         fecha_final = st.date_input("Fecha final", value=hoy)
+
+    parametros_sel = st.multiselect(
+        "Parámetro(s) a exportar",
+        options=list(PARAMETROS_DISPONIBLES.keys()),
+        default=["Potencia Activa (MW)"],
+    )
+
+    formato_label = st.selectbox("Formato de salida", list(FORMATOS.keys()))
 
     with st.expander("Parámetros avanzados"):
         empresas = st.text_area(
@@ -139,25 +181,41 @@ with st.form("form_descarga"):
             "Tipos de generación (IDs separados por coma)",
             value=DEFAULT_TIPOS_GENERACION,
         )
-        parametros = st.text_input(
-            "Parámetros (IDs separados por coma)",
-            value=DEFAULT_PARAMETROS,
+        tipos_empresa = st.text_input(
+            "Tipos de empresa (IDs separados por coma, puede dejarse vacío)",
+            value="",
+            help=(
+                "El JS del COES también envía un campo 'tiposEmpresa' que proviene "
+                "de un multiselect (#cbTipoEmpresa) que no vimos con sus opciones "
+                "reales. Si tu exportación falla, revisa este filtro en la página "
+                "y copia los valores que use."
+            ),
         )
-        central = st.text_input("Central", value="1")
-        tipo = st.text_input("Tipo", value="2")
-        formato_label = st.selectbox("Formato de salida", list(FORMATOS.keys()))
+        central_label = st.selectbox(
+            "Central", list(CENTRAL_OPCIONES.keys()), index=1  # COES por defecto
+        )
 
     enviado = st.form_submit_button("Descargar reporte")
 
 if enviado:
+    dias = (fecha_final - fecha_inicial).days
+
     if fecha_inicial > fecha_final:
         st.error("La fecha inicial no puede ser posterior a la fecha final.")
+    elif dias > MAX_DIAS_RANGO:
+        st.error(
+            f"El rango de fechas es de {dias} días, y el COES solo permite "
+            f"hasta {MAX_DIAS_RANGO} días por exportación. Achica el rango."
+        )
+    elif not parametros_sel:
+        st.error("Selecciona al menos un parámetro a exportar.")
+    elif FORMATOS[formato_label] == "3" and len(parametros_sel) != 1:
+        st.error("Para exportar en CSV solo puedes seleccionar un parámetro.")
     else:
         fi_str = fecha_inicial.strftime("%d/%m/%Y")
         ff_str = fecha_final.strftime("%d/%m/%Y")
+        parametros_str = ",".join(PARAMETROS_DISPONIBLES[p] for p in parametros_sel)
 
-        # Inicializamos siempre las 3 variables para evitar NameError
-        # si el bloque try falla antes de asignarlas.
         contenido = None
         content_type_o_error = None
         nombre_archivo = None
@@ -170,16 +228,15 @@ if enviado:
                     fecha_final=ff_str,
                     empresas=empresas,
                     tipos_generacion=tipos_generacion,
-                    central=central,
-                    parametros=parametros,
-                    tipo=tipo,
-                    formato=FORMATOS[formato_label],
+                    tipos_empresa=tipos_empresa,
+                    central=CENTRAL_OPCIONES[central_label],
+                    parametros=parametros_str,
+                    tipo=FORMATOS[formato_label],
                 )
             except requests.exceptions.Timeout:
                 error_conexion = (
                     "El portal del COES tardó demasiado en responder (timeout). "
-                    "El reporte puede tardar más para rangos de fechas largos; "
-                    "intenta un rango más corto o vuelve a intentarlo más tarde."
+                    "Intenta un rango más corto o vuelve a intentarlo más tarde."
                 )
             except requests.exceptions.RequestException as exc:
                 error_conexion = f"Error de conexión con el portal del COES: {exc}"
@@ -187,22 +244,17 @@ if enviado:
         if error_conexion:
             st.error(error_conexion)
         elif contenido is None and content_type_o_error is not None:
-            # content_type_o_error contiene el mensaje de error (caso JSON inesperado)
             st.warning(content_type_o_error)
         elif contenido is not None:
             # Un .xlsx real es un ZIP por dentro: siempre empieza con esta firma.
             es_zip_valido = contenido[:4] == b"PK\x03\x04"
 
-            if not es_zip_valido:
+            if FORMATOS[formato_label] != "3" and not es_zip_valido:
                 st.error(
                     "El servidor no devolvió un archivo Excel válido "
                     f"(Content-Type: {content_type_o_error!r}, "
-                    f"{len(contenido)} bytes). Esto suele pasar cuando la sesión "
-                    "expiró, el payload es inválido, o el COES devolvió una "
-                    "página de error en vez del reporte. Contenido recibido "
-                    "(puede ser HTML o texto de error):"
+                    f"{len(contenido)} bytes). Contenido recibido:"
                 )
-                # Mostramos el contenido crudo (decodificado si es posible) para diagnosticar
                 try:
                     texto = contenido.decode("utf-8", errors="replace")
                 except Exception:
@@ -210,14 +262,16 @@ if enviado:
                 st.code(texto[:2000])
             else:
                 st.success(f"Archivo listo: {nombre_archivo}")
+                mime_por_defecto = (
+                    "text/csv"
+                    if FORMATOS[formato_label] == "3"
+                    else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
                 st.download_button(
                     label="⬇️ Guardar archivo",
                     data=io.BytesIO(contenido),
                     file_name=nombre_archivo,
-                    mime=(
-                        content_type_o_error
-                        or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    ),
+                    mime=content_type_o_error or mime_por_defecto,
                 )
         else:
             st.error("No se pudo obtener el archivo por un motivo desconocido.")
