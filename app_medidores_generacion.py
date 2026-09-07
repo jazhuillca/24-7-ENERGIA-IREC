@@ -395,6 +395,40 @@ CENTRALES_A_INCLUIR_DEFAULT = [
 ]
 
 
+def _aplanar_encabezado_vertical(df_final: pd.DataFrame, col_fecha_hora: tuple) -> pd.DataFrame:
+    """Convierte el encabezado de 2 niveles (Empresa, Central) del formato
+    Vertical a uno solo, plano: la primera columna se llama "Fecha/Hora" y
+    las demás llevan directamente el nombre de la Central (sin la fila
+    "Empresa"/"Central" que pandas agrega por defecto al exportar un
+    DataFrame con columnas MultiIndex + índice con nombre, que queda
+    confuso: "Fecha/Hora" termina en su propia fila, sin nada al lado).
+
+    Si dos empresas distintas comparten el mismo nombre de central (caso
+    raro, pero posible), esa central puntual se distingue como
+    "Central (Empresa)" para no mezclar sus datos bajo un solo encabezado;
+    el resto queda simplemente como "Central"."""
+    conteo_centrales = {}
+    for col in df_final.columns:
+        if col == col_fecha_hora:
+            continue
+        _empresa, central = col
+        conteo_centrales[central] = conteo_centrales.get(central, 0) + 1
+
+    df_plano = df_final.copy()
+    nuevas_columnas = []
+    for col in df_plano.columns:
+        if col == col_fecha_hora:
+            nuevas_columnas.append("Fecha/Hora")
+        else:
+            empresa, central = col
+            if conteo_centrales[central] > 1:
+                nuevas_columnas.append(f"{central} ({empresa})")
+            else:
+                nuevas_columnas.append(central)
+    df_plano.columns = nuevas_columnas
+    return df_plano
+
+
 def _parsear_vertical_coes(contenido: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Parser específico para el formato 'Excel Vertical' de COES.
 
@@ -917,6 +951,13 @@ if submitted:
                 if df_auditoria is not None:
                     df_auditoria = df_auditoria[df_auditoria["Central"].isin(centrales_sel)].reset_index(drop=True)
 
+        if es_formato_vertical:
+            # Encabezado plano de una sola fila: "Fecha/Hora" en la primera
+            # columna, nombre de la Central en las demás (en vez del
+            # encabezado de 2 niveles + fila de índice aparte que generaba
+            # pandas por defecto, que quedaba confuso al exportar).
+            df_final = _aplanar_encabezado_vertical(df_final, col_fecha_hora)
+
         with st.expander("👀 Ver columnas detectadas (para verificar que el encabezado se leyó bien)"):
             st.write(list(df_final.columns))
 
@@ -944,19 +985,9 @@ if submitted:
         # Descarga xlsx
         buf_xlsx = io.BytesIO()
         with pd.ExcelWriter(buf_xlsx, engine="openpyxl") as writer:
-            if es_formato_vertical:
-                # pandas no soporta escribir a Excel con columnas de varios
-                # niveles e index=False, así que Fecha/Hora se pasa a ser el
-                # índice real solo para este paso (queda igual de visible,
-                # como primera columna, pero sin duplicar información).
-                col_fecha_hora = ("Fecha/Hora", "")
-                df_excel = df_final.set_index(col_fecha_hora)
-                df_excel.index.name = "Fecha/Hora"
-                df_excel.to_excel(writer, index=True, sheet_name="MedidoresGeneracion")
-                if df_auditoria is not None:
-                    df_auditoria.to_excel(writer, index=False, sheet_name="Auditoria")
-            else:
-                df_final.to_excel(writer, index=False, sheet_name="MedidoresGeneracion")
+            df_final.to_excel(writer, index=False, sheet_name="MedidoresGeneracion")
+            if df_auditoria is not None:
+                df_auditoria.to_excel(writer, index=False, sheet_name="Auditoria")
         st.download_button(
             "⬇️ Descargar Excel consolidado",
             data=buf_xlsx.getvalue(),
