@@ -484,7 +484,27 @@ with st.form("form_descarga"):
         default=["Potencia Activa (MW)"],
     )
 
-    formato_label = st.selectbox("Formato de salida", list(FORMATOS.keys()))
+    formato_label = st.selectbox(
+        "Formato de salida",
+        list(FORMATOS.keys()),
+        index=1,  # "Excel Vertical" por defecto
+        help=(
+            "Para armar una base de datos que crezca mes a mes, usa "
+            "'Excel Vertical': cada central/unidad es una FILA, así que "
+            "cuando aparezcan centrales nuevas el encabezado no cambia. "
+            "'Excel Horizontal' pone cada central como una COLUMNA con "
+            "encabezados de varias filas combinadas — no está soportado "
+            "por el parser automático de esta app todavía."
+        ),
+    )
+    if formato_label == "Excel Horizontal":
+        st.warning(
+            "⚠️ El formato Horizontal tiene un encabezado de 4 filas con "
+            "celdas combinadas (PUNTO MEDICIÓN / EMPRESA / CENTRAL / UNIDAD) "
+            "que el parser automático de esta app aún no interpreta — fallará "
+            "al intentar leerlo como tabla. Usa 'Excel Vertical' para que la "
+            "descarga funcione de punta a punta."
+        )
 
     with st.expander("Parámetros avanzados"):
         tipos_generacion = st.text_input(
