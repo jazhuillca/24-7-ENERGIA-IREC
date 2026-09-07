@@ -23,6 +23,7 @@ import io
 import re
 from datetime import date, timedelta
 
+import pandas as pd
 import requests
 import streamlit as st
 
@@ -194,6 +195,21 @@ FORMATOS = {
 MAX_DIAS_RANGO = 31  # límite real que impone el JS del COES
 
 
+def dividir_en_tramos(fecha_inicio: date, fecha_fin: date, max_dias: int = MAX_DIAS_RANGO):
+    """
+    Divide [fecha_inicio, fecha_fin] en tramos consecutivos de a lo más
+    `max_dias` días cada uno (inclusive), replicando el límite que impone
+    el propio formulario del COES por cada exportación.
+    """
+    tramos = []
+    actual = fecha_inicio
+    while actual <= fecha_fin:
+        fin_tramo = min(actual + timedelta(days=max_dias - 1), fecha_fin)
+        tramos.append((actual, fin_tramo))
+        actual = fin_tramo + timedelta(days=1)
+    return tramos
+
+
 # ---------------------------------------------------------------------------
 # Lógica de descarga (replicando exportarFormato del JS real)
 # ---------------------------------------------------------------------------
@@ -293,6 +309,18 @@ def descargar_medidores_generacion(
     return resp.content, content_type, nombre_archivo
 
 
+def parsear_a_dataframe(contenido: bytes, tipo: str, hoja: int | str = 0) -> pd.DataFrame:
+    """
+    Convierte los bytes crudos devueltos por el COES en un DataFrame.
+    tipo: '1' (Excel Horizontal), '2' (Excel Vertical) o '3' (CSV).
+    `hoja` selecciona la hoja del Excel si el archivo tiene varias
+    (por defecto la primera).
+    """
+    if tipo == "3":
+        return pd.read_csv(io.BytesIO(contenido))
+    return pd.read_excel(io.BytesIO(contenido), sheet_name=hoja, engine="openpyxl")
+
+
 # ---------------------------------------------------------------------------
 # UI de Streamlit
 # ---------------------------------------------------------------------------
@@ -305,9 +333,10 @@ st.caption(
 )
 
 st.info(
-    f"El propio formulario del COES limita cada exportación a un rango máximo "
-    f"de **{MAX_DIAS_RANGO} días**, y si eliges formato **CSV** solo puedes "
-    f"seleccionar **un** parámetro a la vez.",
+    f"El formulario del COES limita cada exportación a **{MAX_DIAS_RANGO} días**, "
+    f"pero esta app **divide automáticamente** rangos más largos (incluso de "
+    f"más de un año) en varios tramos y te los entrega juntos. Si eliges "
+    f"formato **CSV**, solo puedes seleccionar **un** parámetro a la vez.",
     icon="ℹ️",
 )
 
@@ -349,6 +378,16 @@ with st.form("form_descarga"):
     with col2:
         fecha_final = st.date_input("Fecha final", value=hoy)
 
+    empresas_cargadas = st.session_state["empresas_disponibles"]
+    empresas_sel = st.multiselect(
+        "Empresa(s)",
+        options=[nombre for _id, nombre in empresas_cargadas],
+        default=[],
+        help="Deja vacío para incluir todas las empresas.",
+    )
+    nombre_a_id = {nombre: id_ for id_, nombre in empresas_cargadas}
+    empresas = ",".join(nombre_a_id[n] for n in empresas_sel)
+
     parametros_sel = st.multiselect(
         "Parámetro(s) a exportar",
         options=list(PARAMETROS_DISPONIBLES.keys()),
@@ -358,16 +397,6 @@ with st.form("form_descarga"):
     formato_label = st.selectbox("Formato de salida", list(FORMATOS.keys()))
 
     with st.expander("Parámetros avanzados"):
-        empresas_cargadas = st.session_state["empresas_disponibles"]
-        empresas_sel = st.multiselect(
-            "Empresas",
-            options=[nombre for _id, nombre in empresas_cargadas],
-            default=[],
-            help="Vacío = todas las empresas (igual que el comportamiento del formulario original).",
-        )
-        nombre_a_id = {nombre: id_ for id_, nombre in empresas_cargadas}
-        empresas = ",".join(nombre_a_id[n] for n in empresas_sel)
-
         tipos_generacion = st.text_input(
             "Tipos de generación (IDs separados por coma)",
             value=DEFAULT_TIPOS_GENERACION,
@@ -379,79 +408,112 @@ with st.form("form_descarga"):
     enviado = st.form_submit_button("Descargar reporte")
 
 if enviado:
-    dias = (fecha_final - fecha_inicial).days
-
     if fecha_inicial > fecha_final:
         st.error("La fecha inicial no puede ser posterior a la fecha final.")
-    elif dias > MAX_DIAS_RANGO:
-        st.error(
-            f"El rango de fechas es de {dias} días, y el COES solo permite "
-            f"hasta {MAX_DIAS_RANGO} días por exportación. Achica el rango."
-        )
     elif not parametros_sel:
         st.error("Selecciona al menos un parámetro a exportar.")
     elif FORMATOS[formato_label] == "3" and len(parametros_sel) != 1:
         st.error("Para exportar en CSV solo puedes seleccionar un parámetro.")
     else:
-        fi_str = fecha_inicial.strftime("%d/%m/%Y")
-        ff_str = fecha_final.strftime("%d/%m/%Y")
         parametros_str = ",".join(PARAMETROS_DISPONIBLES[p] for p in parametros_sel)
+        tipo_val = FORMATOS[formato_label]
+        tramos = dividir_en_tramos(fecha_inicial, fecha_final)
 
-        contenido = None
-        content_type_o_error = None
-        nombre_archivo = None
-        error_conexion = None
+        if len(tramos) > 1:
+            st.info(
+                f"El rango pedido supera los {MAX_DIAS_RANGO} días que permite el COES "
+                f"por exportación, así que se descargará en **{len(tramos)} tramos** "
+                f"y se armará un solo DataFrame con todo.",
+                icon="📦",
+            )
 
-        with st.spinner(f"Descargando medidores de generación {fi_str} – {ff_str} ..."):
+        dataframes = []  # DataFrames ya parseados, uno por tramo exitoso
+        errores = []  # lista de (rango_str, mensaje)
+        progreso = st.progress(0.0)
+        estado = st.empty()
+
+        for i, (t_ini, t_fin) in enumerate(tramos, start=1):
+            fi_str = t_ini.strftime("%d/%m/%Y")
+            ff_str = t_fin.strftime("%d/%m/%Y")
+            estado.text(f"Descargando y leyendo tramo {i}/{len(tramos)}: {fi_str} – {ff_str} ...")
+
             try:
-                contenido, content_type_o_error, nombre_archivo = descargar_medidores_generacion(
+                contenido, content_type_o_error, _nombre = descargar_medidores_generacion(
                     fecha_inicial=fi_str,
                     fecha_final=ff_str,
                     empresas=empresas,
                     tipos_generacion=tipos_generacion,
                     central=CENTRAL_OPCIONES[central_label],
                     parametros=parametros_str,
-                    tipo=FORMATOS[formato_label],
+                    tipo=tipo_val,
                 )
             except requests.exceptions.Timeout:
-                error_conexion = (
-                    "El portal del COES tardó demasiado en responder (timeout). "
-                    "Intenta un rango más corto o vuelve a intentarlo más tarde."
-                )
+                errores.append((f"{fi_str}–{ff_str}", "Timeout esperando respuesta del COES."))
+                progreso.progress(i / len(tramos))
+                continue
             except requests.exceptions.RequestException as exc:
-                error_conexion = f"Error de conexión con el portal del COES: {exc}"
+                errores.append((f"{fi_str}–{ff_str}", f"Error de conexión: {exc}"))
+                progreso.progress(i / len(tramos))
+                continue
 
-        if error_conexion:
-            st.error(error_conexion)
-        elif contenido is None and content_type_o_error is not None:
-            st.warning(content_type_o_error)
-        elif contenido is not None:
-            # Un .xlsx real es un ZIP por dentro: siempre empieza con esta firma.
-            es_zip_valido = contenido[:4] == b"PK\x03\x04"
-
-            if FORMATOS[formato_label] != "3" and not es_zip_valido:
-                st.error(
-                    "El servidor no devolvió un archivo Excel válido "
-                    f"(Content-Type: {content_type_o_error!r}, "
-                    f"{len(contenido)} bytes). Contenido recibido:"
-                )
-                try:
-                    texto = contenido.decode("utf-8", errors="replace")
-                except Exception:
-                    texto = repr(contenido[:500])
-                st.code(texto[:2000])
+            if contenido is None:
+                errores.append((f"{fi_str}–{ff_str}", content_type_o_error or "Respuesta vacía."))
             else:
-                st.success(f"Archivo listo: {nombre_archivo}")
-                mime_por_defecto = (
-                    "text/csv"
-                    if FORMATOS[formato_label] == "3"
-                    else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                es_zip_valido = contenido[:4] == b"PK\x03\x04"
+                if tipo_val != "3" and not es_zip_valido:
+                    errores.append(
+                        (f"{fi_str}–{ff_str}", "El servidor no devolvió un Excel válido.")
+                    )
+                else:
+                    try:
+                        df_tramo = parsear_a_dataframe(contenido, tipo_val)
+                        df_tramo["_tramo_desde"] = fi_str
+                        df_tramo["_tramo_hasta"] = ff_str
+                        dataframes.append(df_tramo)
+                    except Exception as exc:
+                        errores.append(
+                            (f"{fi_str}–{ff_str}", f"No se pudo leer como tabla: {exc}")
+                        )
+
+            progreso.progress(i / len(tramos))
+
+        estado.empty()
+        progreso.empty()
+
+        if errores:
+            with st.expander(f"⚠️ {len(errores)} tramo(s) fallaron", expanded=not dataframes):
+                for rango, msg in errores:
+                    st.write(f"**{rango}**: {msg}")
+
+        if dataframes:
+            df_final = pd.concat(dataframes, ignore_index=True)
+
+            st.success(
+                f"Se combinaron {len(dataframes)} de {len(tramos)} tramo(s) en un "
+                f"solo DataFrame: **{len(df_final):,} filas** × {len(df_final.columns)} columnas."
+            )
+
+            st.dataframe(df_final, use_container_width=True, height=400)
+
+            col_desc1, col_desc2 = st.columns(2)
+            with col_desc1:
+                csv_bytes = df_final.to_csv(index=False).encode("utf-8-sig")
                 st.download_button(
-                    label="⬇️ Guardar archivo",
-                    data=io.BytesIO(contenido),
-                    file_name=nombre_archivo,
-                    mime=content_type_o_error or mime_por_defecto,
+                    label="⬇️ Descargar como CSV",
+                    data=csv_bytes,
+                    file_name=f"medidores_generacion_{fecha_inicial.isoformat()}_{fecha_final.isoformat()}.csv",
+                    mime="text/csv",
+                )
+            with col_desc2:
+                excel_buffer = io.BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                    df_final.to_excel(writer, sheet_name="Medidores", index=False)
+                excel_buffer.seek(0)
+                st.download_button(
+                    label="⬇️ Descargar como Excel",
+                    data=excel_buffer,
+                    file_name=f"medidores_generacion_{fecha_inicial.isoformat()}_{fecha_final.isoformat()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
         else:
-            st.error("No se pudo obtener el archivo por un motivo desconocido.")
+            st.error("No se pudo descargar ni leer ningún tramo. Revisa los errores arriba.")
